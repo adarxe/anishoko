@@ -11,3 +11,4 @@
 # Ignorar carpetas caché de Python
 __pycache__/
 *.pyc
+lab-shoko/
