@@ -1,14 +1,15 @@
-# Archivos de entorno y secretos
+# Archivos de configuración con contraseñas/tokens
 .env
 
-# Ignorar bases de datos de SQLite
+# Base de datos SQLite y archivos temporales de WAL
 *.db
-*.sqlite3
+*.db-wal
+*.db-shm
 
-# Ignorar archivos de registro
-*.log
-
-# Ignorar carpetas caché de Python
+# Caché de Python
 __pycache__/
 *.pyc
-lab-shoko/
+
+# Entornos virtuales si los usas
+venv/
+.venv/
