@@ -1,0 +1,12 @@
+# Ignorar archivos del entorno y variables secretas
+.env
+.env.example
+
+# Ignorar archivos de base de datos
+*.duckdb
+duckdb/
+duckdb.wal
+
+# Ignorar archivos temporales y caché
+__pycache__/
+
