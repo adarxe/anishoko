@@ -1,12 +1,14 @@
-import duckdb
+import sqlite3
 import logging
 from config import DB_FILE
 
 logger = logging.getLogger("ShokoAniSync")
 
 def get_connection():
-    """Retorna una conexión a la base de datos DuckDB."""
-    return duckdb.connect(str(DB_FILE))
+    # check_same_thread=False es vital para que los hilos web y workers usen la DB
+    conn = sqlite3.connect(str(DB_FILE), check_same_thread=False)
+    conn.execute('PRAGMA journal_mode=WAL;') 
+    return conn
 
 def init_db():
     """Inicializa todas las tablas y realiza migraciones de columnas si no existen."""

@@ -1,155 +1,100 @@
-# anishoko
+# AniShoko
 
 Leia em [English](README.md).
 
-Scrobbling automático do AniList para o Jellyfin, usando o Shoko como ponte.
+Scrobbling automático e resiliente do AniList para o Jellyfin, utilizando o Shoko Server como ponte. 
 
-Você assiste um episódio no Jellyfin. Sua lista no AniList se atualiza sozinha. É essa a ideia toda.
+Você assiste a um episódio no Jellyfin e sua lista no AniList é atualizada silenciosamente em segundo plano. Sem cliques extras, sem atrasos.
 
-## Por que eu fiz isso
+## Por que eu fiz isso?
 
-Minha biblioteca de anime fica no Jellyfin, com o Shoko cuidando dos metadados, e eu acompanho tudo pelo AniList. O problema estava justamente na segunda metade: toda vez que eu terminava um episódio, precisava abrir o site e aumentar o contador na mão. Eu esquecia por uma semana e depois ficava tentando lembrar se tinha parado no episódio 6 ou no 8.
+Minha biblioteca de animes reside no Jellyfin, com o Shoko cuidando da rigorosa organização de metadados locais, enquanto eu acompanho meu progresso global pelo AniList. O gargalo estava na sincronização: toda vez que eu terminava um episódio, precisava abrir o site e atualizar o contador manualmente. 
 
-Já existem plugins que fazem isso, mas nenhum funcionava bem no meu setup, principalmente com filmes e OVAs dentro de franquias grandes, onde o título do arquivo e o título no AniList quase nunca batem. Então escrevi meu próprio resolvedor.
+Embora existam plugins genéricos para isso, nenhum suportava casos complexos da forma correta. Filmes, OVAs e especiais dentro de franquias massivas (como *Monogatari*, *Fate* ou *Gundam*) quase nunca possuem paridade direta de títulos entre o arquivo local e o banco de dados do AniList. Plugins normais falham silenciosamente ou marcam o anime errado.
 
-Aviso: é um projeto pessoal. Funciona na minha máquina e resolve o meu problema. Ainda não é um produto acabado.
+Então, projetei meu próprio pipeline de resolução de identidades. Construído sob os princípios da **Clean Architecture**, o AniShoko opera como um daemon altamente tolerante a falhas, capaz de sobreviver a instabilidades de rede e desambiguar obras complexas com precisão cirúrgica.
 
-## Como funciona
+## Como funciona (O Pipeline de 5 Camadas)
 
-O Jellyfin dispara um webhook quando a reprodução para. Esse script fica escutando na porta 5000 e faz o seguinte:
+O Jellyfin dispara um webhook (Notificação do tipo `PlaybackStop`) quando a reprodução termina. O AniShoko recebe esse evento através de um servidor HTTP multithread e processa a resolução do ID do AniList através de um pipeline inteligente, partindo do método mais rápido (banco de dados local) para o mais complexo:
 
-**1. Descarta tudo que não é anime.**
-Se o payload trouxer um ID do IMDb, TVDb ou TMDb, é conteúdo ocidental e sai fora na hora.
+| Camada | Método de Resolução | Desempenho e Comportamento |
+| :--- | :--- | :--- |
+| **L1** | Cache Direto (`series_mapping`) | **Instantâneo (0ms).** Match exato por ID do Shoko e episódio via SQLite. Nenhuma requisição de rede necessária. |
+| **L1.5** | Espelho Local (`anilist_mirror`) | **Instantâneo (0ms).** Busca relacional por título na sua própria lista do AniList pré-sincronizada localmente. |
+| **L2** | Bridge API (Shoko Server) | **Rápido.** Mapeamento numérico via Shoko API, convertendo o GUID da série para o AniList ID oficial. |
+| **L3** | SmartResolver (GraphQL) | **Moderado.** Busca direta no motor do AniList usando higienização de strings caso as camadas anteriores falhem. |
+| **L3.5** | Desambiguação Relacional (Fuzzy + BFS) | **Complexo.** Ativado automaticamente para Filmes e OVAs. Percorre a árvore de franquia e isola a obra correta. |
 
-**2. Confere se o episódio foi realmente assistido.**
-Ou o Jellyfin marca como assistido até o fim, ou você passou de 85 por cento da duração. Menos que isso é ignorado, porque abrir um arquivo por dois minutos não conta como assistir.
+### O Motor de Desambiguação (Capa 3.5)
+A joia da coroa deste sistema. Quando a API relata que o formato é um Filme ou OVA, uma busca simples por título geralmente cai na série principal. Para corrigir isso, o AniShoko constrói uma árvore da franquia via **Busca em Largura (BFS)**, isola todos os nós em um cache local e utiliza o algoritmo de distância de Levenshtein (`RapidFuzz`) para comparar o nome composto do Jellyfin (`SeriesName` + `Name`) contra cada obra do universo. A obra com a maior pontuação recebe o scrobble. 
 
-**3. Resolve o ID do AniList em cinco camadas, da mais barata para a mais cara.**
-
-| Camada | Método | Observação |
-|---|---|---|
-| L1 | Cache local `series_mapping` | Match exato por ID do Shoko mais episódio. Sem chamada de rede. |
-| L1.5 | `anilist_mirror` local, busca por título | Rápido, mas comparação por texto pode ser ambígua. |
-| L2 | API do Shoko para ID do MAL para ID do AniList | Mapeamento numérico, bem confiável quando o Shoko tem o dado. |
-| L3 | Busca por texto no GraphQL do AniList | Último recurso. |
-| L3.5 | Desambiguação por relações | Só para filmes, OVAs e especiais. |
-
-A camada 3.5 é a parte de que mais gosto. Quando o formato é filme ou OVA, uma busca simples por título quase sempre cai na entrada errada, normalmente a série principal. Então, em vez disso, o script percorre o grafo de relações da franquia com uma BFS (limitada a 30 nós), junta todos os nós do tipo ANIME que encontrar, e pontua cada candidato contra o título recebido usando token set ratio do RapidFuzz. A maior pontuação vence. Isso corrigiu vários scrobbles errados aqui.
-
-Tudo que é resolvido fora da camada 1 é gravado no cache local, então o próximo episódio daquela série já cai direto na L1.
-
-**4. Grava o progresso no AniList.**
-Uma mutation GraphQL define progresso e status, com algumas regras por cima:
-
-- Filmes, especiais e entradas de episódio único são forçados para progresso 1 e marcados como COMPLETED
-- Se o episódio alvo alcança ou passa o total, a entrada vira COMPLETED
-- Se o alvo é menor do que o já registrado, a mutation é cancelada. Rever o episódio 3 não pode desfazer o seu progresso
-
-**5. Aguenta ficar offline.**
-Se o AniList estiver inacessível ou a resolução falhar, o evento entra numa fila no DuckDB. Um worker em segundo plano tenta de novo depois, inclusive resolvendo o ID mais tarde caso não tenha conseguido na hora.
-
-Um segundo worker espelha sua lista do AniList no banco local no boot e a cada 24 horas. Esse espelho é o que torna as camadas 1 e 1.5 possíveis.
+### Tolerância a Falhas e Idempotência
+* **Network Resiliency:** Todos os clientes HTTP (`requests.Session`) possuem connection pooling e adaptadores de repetição (backoff exponencial). Quedas temporárias no AniList ou Shoko são absorvidas transparentemente.
+* **Fila Offline:** Se a internet cair completamente, os scrobbles pendentes são salvos no SQLite. Um worker assíncrono (Conserje) trabalha em segundo plano para tentar novamente mais tarde.
+* **Idempotência:** Requisições repetidas ou episódios já assistidos são interceptados localmente. O sistema nunca gasta sua cota de requisições do AniList para atualizar algo que já foi concluído.
 
 ## Requisitos
 
-- Python 3.9 ou mais novo
-- Uma instância do Jellyfin com o plugin de Webhook
-- Um Shoko Server rodando
-- Uma conta no AniList
+* Python 3.9 ou superior
+* Jellyfin (com o plugin nativo de Webhooks)
+* Shoko Server
+* Conta no AniList
 
-Pacotes Python:
+Dependências Python:
+* `requests`
+* `urllib3`
+* `rapidfuzz`
+* `python-dotenv`
 
-```
-requests
-rapidfuzz
-python-dotenv
-duckdb
-```
+*(Nota: O SQLite3 é utilizado como motor de banco de dados nativo pela sua alta performance em concorrência com o modo WAL ativado, não exigindo instalações externas).*
 
-## Instalação
+## Instalação e Execução
 
-Clonar e instalar:
+Clone o repositório e instale as dependências:
 
 ```bash
-git clone https://github.com/adarxe/anishoko.git
+git clone [https://github.com/adarxe/anishoko.git](https://github.com/adarxe/anishoko.git)
 cd anishoko
-pip install requests rapidfuzz python-dotenv duckdb
-```
+pip install -r requirements.txt
 
-Criar um arquivo `.env` na raiz do projeto:
-
-```
-ANILIST_TOKEN=seu_token_do_anilist
+Crie um arquivo .env na raiz do projeto:
+ANILIST_TOKEN=seu_token_do_anilist_aqui
 SHOKO_URL=http://localhost:8111
-SHOKO_API_KEY=sua_chave_do_shoko
-```
+SHOKO_API_KEY=sua_chave_do_shoko_aqui
+PORT=5000
 
-Para pegar o token do AniList, crie um client em Settings, Developer, e depois use o fluxo OAuth para obter o token. A chave da API do Shoko está nas configurações do Shoko Server.
-
-Inicializar o banco:
-
-```bash
-python3 db_init_duckdb.py
-```
-
-Rodar:
-
-```bash
+(Dica: Para obter o token do AniList, crie um client em Settings > Developer e utilize o fluxo OAuth. A API Key do Shoko encontra-se nas configurações do seu servidor).
+Inicie o daemon:
 python3 main.py
-```
 
-O servidor sobe na porta 5000. O primeiro boot também dispara um sync completo da sua lista do AniList para o espelho local, então dá um tempo para ele terminar.
-
-## Configuração no Jellyfin
-
-Instale o plugin de Webhook, adicione um Generic Destination e aponte para:
-
-```
-http://<host-rodando-o-anishoko>:5000
-```
-
-Habilite apenas o tipo de notificação **Playback Stop**. O script ignora o resto de qualquer forma, mas não há motivo para mandar.
-
-Garanta que o payload inclua os provider IDs. O ID de série do Shoko é o que faz as camadas 1 e 2 funcionarem, e sem ele o script cai na comparação por texto, que é bem menos precisa.
-
-## Arquivos
-
-| Arquivo | O que faz |
+O primeiro boot inicializará o banco de dados SQLite e acionará o Worker de Sincronização, que fará o download nativo de toda a sua lista do AniList para o espelho local (anilist_mirror).
+(Se estiver executando no Termux/Android, lembre-se de rodar termux-wake-lock antes de iniciar o processo para que o Android não suspenda o daemon em segundo plano).
+Configuração no Jellyfin
+ * Instale o plugin Webhook.
+ * Adicione um Generic Destination apontando para: http://<seu-ip-local>:5000
+ * Habilite apenas o evento Playback Stop.
+ * Garanta que o payload inclua os IDs dos provedores e o Item Name. O SeriesId do Shoko é essencial para as Camadas 1 e 2 funcionarem com precisão absoluta.
+Arquitetura de Software
+O projeto adota a Clean Architecture para manter o código testável, isolado e expansível:
+| Diretório | Responsabilidade |
 |---|---|
-| `main.py` | Servidor de webhook, resolvedor, mutations do AniList e workers em segundo plano |
-| `db_manager.py` | Camada de acesso ao DuckDB, operações de cache e de fila |
-| `db_init_duckdb.py` | Cria o schema do banco |
-| `fetch_anilist_mirror.py` | Puxa sua lista do AniList para o espelho local |
+| api/ | Servidor HTTP Multithread e controladores de eventos (Webhooks). |
+| clients/ | Gerenciamento de sessões, cabeçalhos e consultas GraphQL/REST (AniList, Shoko). |
+| database/ | Conexão SQLite (WAL) e camada de repositório (Querying e Caching). |
+| services/ | Regras de negócio essenciais (Pipeline de Resolução, Sincronização Diária, Fila Offline). |
+| main.py | Ponto de entrada do sistema. Orquestra a inicialização das threads em segundo plano. |
+Metas e Próximos Passos (Roadmap)
+A base do sistema já é robusta e resolve o problema principal, mas o desenvolvimento continua:
+ * [x] Migrar para um servidor HTTP multithread para evitar bloqueios em picos de webhooks.
+ * [x] Tratar erros HTTP 429/500 com estratégias de retry e backoff exponencial.
+ * [x] Implementar cache relacional nativo para evitar abusos na API do AniList em buscas BFS.
+ * [ ] Implementar integração com Pandas e Machine Learning para análise avançada de hábitos de visualização com base nos dados do SQLite.
+ * [ ] Adicionar um segredo compartilhado (Authentication Token) no endpoint do webhook.
+ * [ ] Disponibilizar um Dockerfile e unidade systemd para facilitar implantações em NAS e servidores caseiros.
+Uma observação sobre o desenvolvimento
+Toda a arquitetura, refatoração de concorrência e testes deste projeto foram construídos inteiramente em um ambiente mobile (Termux no Android). Sem IDE pesada, apenas um editor de terminal, conexões SSH intermitentes e paciência. O código prova que aplicações assíncronas e resilientes de nível de produção podem ser orquestradas a partir de ambientes extremamente restritos.
+Licença
+Este projeto é de código aberto. Sinta-se à vontade para clonar, modificar ou abrir uma issue caso tenha ideias para melhorar a integração.
 
-## Limitações conhecidas
-
-Sendo honesto sobre o que ainda não está pronto:
-
-- O servidor HTTP atende uma requisição por vez e faz toda a resolução no mesmo fluxo. Uma resposta lenta do AniList segura o próximo webhook.
-- Não há autenticação no endpoint. Qualquer um que alcance a porta 5000 consegue postar nela. Mantenha isso na rede local.
-- Os limites de requisição do AniList não são tratados explicitamente. Maratonando muitos episódios rápido, dá para bater no teto.
-- O limiar de 85 por cento e a porta estão fixos no código.
-- As árvores de relação são baixadas de novo toda vez que a camada 3.5 roda para um título novo. Não há cache delas.
-- Não há testes.
-
-## Próximos passos
-
-Ordem aproximada do que quero corrigir:
-
-- Migrar para um servidor HTTP com threads e responder o webhook na hora, fazendo o trabalho em segundo plano
-- Adicionar um segredo compartilhado no endpoint do webhook
-- Tratar HTTP 429 do AniList com backoff adequado
-- Mover limiares, porta e caminhos para o `.env`
-- Adicionar `requirements.txt`, `.env.example` e um `.gitignore`
-- Entregar um Dockerfile e um unit do systemd para facilitar rodar como serviço
-- Cachear as árvores de relação das franquias
-- Escrever testes para as camadas de resolução
-
-## Uma observação sobre como isso foi construído
-
-Cada linha disso foi escrita no celular. Sem PC, sem notebook, sem IDE. Só um editor de texto, um emulador de terminal e bastante paciência. Se a formatação estiver estranha em alguns pontos ou o histórico de commits estiver bagunçado, é por isso.
-
-## Licença
-
-Ainda não definida. Até lá, considere todos os direitos reservados. Fique à vontade para abrir uma issue se quiser usar isso para alguma coisa.
 

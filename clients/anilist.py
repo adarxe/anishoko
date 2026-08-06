@@ -1,11 +1,36 @@
 import time
 import requests
 import logging
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from config import ANILIST_TOKEN
 from database.connection import get_connection
 from database.repository import get_cached_relations, save_cached_relations
 
 logger = logging.getLogger("ShokoAniSync")
+
+# Configuracion de Sesion y Resiliencia de Red
+session = requests.Session()
+retry_strategy = Retry(
+    total=3,  # Maximo de 3 reintentos por fallo
+    backoff_factor=1,  # Esperas de 1s, 2s, 4s entre reintentos
+    status_forcelist=[429, 500, 502, 503, 504],  # Forzar reintento en estos codigos HTTP
+    allowed_methods=["POST"]
+)
+adapter = HTTPAdapter(max_retries=retry_strategy)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
+
+# Inyeccion global de cabeceras
+if ANILIST_TOKEN:
+    session.headers.update({
+        'Authorization': f'Bearer {ANILIST_TOKEN}',
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+    })
+else:
+    logger.warning("[AniListClient] ANILIST_TOKEN no configurado. Las mutaciones fallaran.")
+
 
 def fetch_media_info_from_anilist(anilist_id):
     """Obtiene los metadatos completos de una obra en AniList."""
@@ -25,7 +50,7 @@ def fetch_media_info_from_anilist(anilist_id):
     }
     '''
     try:
-        res = requests.post(
+        res = session.post(
             'https://graphql.anilist.co',
             json={'query': query, 'variables': {'id': int(anilist_id)}},
             timeout=10
@@ -41,20 +66,21 @@ def fetch_media_info_from_anilist(anilist_id):
                 mal_id = data.get("idMal")
                 return fmt, eps, status, t_romaji, t_english, mal_id
     except requests.exceptions.RequestException as e:
-        logger.error("[AniListClient] Error obteniendo metadatos (ID %s): %s", anilist_id, str(e))
+        logger.error("[AniListClient] Error de red obteniendo metadatos (ID %s): %s", anilist_id, str(e))
     return None, None, None, None, None, None
+
 
 def fetch_franchise_relations_bfs(base_anilist_id):
     """
     Realiza un BFS en AniList partiendo de base_anilist_id y recopila todos los nodos
-    de la franquicia que sean de tipo ANIME. Usa la tabla relations_cache de DuckDB.
+    de la franquicia que sean de tipo ANIME. Usa cache local.
     """
     cached = get_cached_relations(base_anilist_id)
     if cached is not None:
-        logger.info("[FranchiseBFS] Arbol de relaciones cargado desde caché local (Base ID %s)", base_anilist_id)
+        logger.info("[FranchiseBFS] Arbol relacional cargado desde cache (Base ID %s)", base_anilist_id)
         return cached
 
-    logger.info("[FranchiseBFS] Descargando arbol relacional completo desde AniList para ID %s...", base_anilist_id)
+    logger.info("[FranchiseBFS] Descargando arbol relacional completo para ID %s...", base_anilist_id)
     
     query = '''
     query ($id: Int) {
@@ -82,19 +108,19 @@ def fetch_franchise_relations_bfs(base_anilist_id):
     queue = [base_anilist_id]
     discovered_anime = []
 
-    while queue and len(visited) < 30:  # Límite preventivo de 30 nodos
+    while queue and len(visited) < 30:  # Limite preventivo de nodos
         current_id = queue.pop(0)
         if current_id in visited:
             continue
         visited.add(current_id)
 
         try:
-            res = requests.post(
+            res = session.post(
                 'https://graphql.anilist.co',
                 json={'query': query, 'variables': {'id': int(current_id)}},
                 timeout=10
             )
-            time.sleep(0.25)  # Respetar rate limits de AniList
+            time.sleep(0.3)  # Rate limit padding (90 rpm AniList limit)
 
             if res.status_code != 200:
                 continue
@@ -125,11 +151,12 @@ def fetch_franchise_relations_bfs(base_anilist_id):
             logger.error("[FranchiseBFS] Error de red explorando nodo %s: %s", current_id, str(e))
 
     save_cached_relations(base_anilist_id, discovered_anime)
-    logger.info("[FranchiseBFS] Arbol relacional finalizado -> %s obras ANIME descubiertas y cacheadas.", len(discovered_anime))
+    logger.info("[FranchiseBFS] Arbol relacional completado -> %s nodos ANIME cacheados.", len(discovered_anime))
     return discovered_anime
 
+
 def post_to_anilist(anilist_id, raw_target_episode, format_type="TV"):
-    """Envía la mutación de actualización a AniList validando la idempotencia local."""
+    """Envia la mutacion de actualizacion a AniList validando la idempotencia local."""
     target_episode = int(raw_target_episode)
     target_status = "CURRENT"
 
@@ -161,7 +188,7 @@ def post_to_anilist(anilist_id, raw_target_episode, format_type="TV"):
         target_status = "COMPLETED"
 
     if target_episode <= current_watched:
-        logger.info("[Validation] Mutacion cancelada por idempotencia (ID %s): Objetivo (%s) <= Actual (%s)", anilist_id, target_episode, current_watched)
+        logger.info("[Validation] Mutacion cancelada (Idempotencia): ID %s | Objetivo (%s) <= Actual (%s)", anilist_id, target_episode, current_watched)
         return True
 
     query = '''
@@ -174,12 +201,6 @@ def post_to_anilist(anilist_id, raw_target_episode, format_type="TV"):
     }
     '''
     
-    headers = {
-        'Authorization': f'Bearer {ANILIST_TOKEN}',
-        'Content-Type': 'application/json',
-        'Accept': 'application/json'
-    }
-    
     payload = {
         'query': query,
         'variables': {
@@ -190,30 +211,31 @@ def post_to_anilist(anilist_id, raw_target_episode, format_type="TV"):
     }
 
     try:
-        res = requests.post(
+        # Cabeceras omitidas explicitamente; son gestionadas por requests.Session()
+        res = session.post(
             'https://graphql.anilist.co',
             json=payload,
-            headers=headers,
             timeout=10
         )
         if res.status_code == 200:
-            logger.info("[AniList API] Mutacion exitosa: ID %s -> Progreso: %s | Estado: %s", anilist_id, target_episode, target_status)
+            logger.info("[AniListClient] Mutacion exitosa: ID %s -> Progreso: %s | Estado: %s", anilist_id, target_episode, target_status)
             try:
                 with get_connection() as conn:
                     conn.execute("UPDATE anilist_mirror SET episodes_watched = ?, user_status = ? WHERE anilist_id = ?", (target_episode, target_status, anilist_id))
             except Exception as db_err:
-                logger.error("[DuckDB] Error sincronizando espejo local: %s", str(db_err))
+                logger.error("[Database] Error actualizando estado de espejo local: %s", str(db_err))
             return True
         else:
-            logger.error("[AniList API] Rechazo del servidor: HTTP %s - %s", res.status_code, res.text)
+            logger.error("[AniListClient] Rechazo de mutacion: HTTP %s - %s", res.status_code, res.text)
             return False
             
     except requests.exceptions.RequestException as e:
-        logger.error("[AniList API] Fallo de conexion externa: %s", str(e))
+        logger.error("[AniListClient] Fallo de conexion en mutacion: %s", str(e))
         return False
 
+
 def resolve_title_smart(clean_title):
-    """Busca el título en AniList mediante GraphQL y retorna su ID y formato."""
+    """Busca el titulo en AniList mediante GraphQL y retorna su ID y formato."""
     query = '''
     query ($search: String) {
       Media (search: $search, type: ANIME) {
@@ -223,7 +245,7 @@ def resolve_title_smart(clean_title):
     }
     '''
     try:
-        res = requests.post(
+        res = session.post(
             'https://graphql.anilist.co',
             json={'query': query, 'variables': {'search': clean_title}},
             timeout=10
@@ -233,6 +255,6 @@ def resolve_title_smart(clean_title):
             if media:
                 return media["id"], media["format"]
     except requests.exceptions.RequestException as e:
-        logger.error("[SmartResolver] Fallo de red: %s", str(e))
+        logger.error("[SmartResolver] Error de red resolviendo titulo: %s", str(e))
     return None, "TV"
 

@@ -7,6 +7,22 @@ logger = logging.getLogger("ShokoAniSync")
 # ==========================================
 # CACHÉ DE RELACIONES (Árboles de Franquicia)
 # ==========================================
+
+def find_anilist_id_in_mirror_by_title(clean_title):
+    """Busca un anilist_id en la tabla espejo local comparando el titulo limpio."""
+    with get_connection() as conn:
+        # Busca coincidencia exacta o parecida en titulo romaji u ingles
+        row = conn.execute('''
+            SELECT anilist_id FROM anilist_mirror 
+            WHERE LOWER(title_romaji) = LOWER(?) 
+               OR LOWER(title_english) = LOWER(?)
+            LIMIT 1
+        ''', (clean_title, clean_title)).fetchone()
+        
+        if row:
+            return row[0]
+    return None
+
 def get_cached_relations(base_anilist_id):
     with get_connection() as conn:
         row = conn.execute("SELECT related_ids_json FROM relations_cache WHERE base_anilist_id = ?", (base_anilist_id,)).fetchone()

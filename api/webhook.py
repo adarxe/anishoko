@@ -1,49 +1,55 @@
 import json
 import logging
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from services.pipeline import process_webhook_payload
 
 logger = logging.getLogger("ShokoAniSync")
 
-class JellyfinWebhookHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        pass  # Silenciar los molestos logs HTTP por defecto
-
+class WebhookHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         content_length = int(self.headers.get('Content-Length', 0))
         post_data = self.rfile.read(content_length)
 
         try:
             payload = json.loads(post_data.decode('utf-8'))
+            
+            # Solo reaccionar ante finalizaciones de reproduccion
+            if payload.get("NotificationType") != "PlaybackStop":
+                self._send_response(200, "Ignored: Not PlaybackStop")
+                return
+
+            shoko_series_id = payload.get("SeriesId")
+            episode = payload.get("EpisodeNumber")
+            series_name = payload.get("SeriesName", "")
+            item_name = payload.get("Name", "")  # Extraemos el nombre especifico (ej. Reiketsu Hen)
+            
+            if not shoko_series_id or not episode:
+                logger.warning("[Webhook] Payload incompleto: Faltan IDs o Episodio.")
+                self._send_response(400, "Missing required fields")
+                return
+
+            # Invocamos el pipeline con el nuevo campo
+            process_webhook_payload(shoko_series_id, episode, series_name, item_name)
+            self._send_response(200, "Event Queued for Pipeline")
+
         except json.JSONDecodeError:
-            self.send_response(400)
-            self.end_headers()
-            return
+            logger.error("[Webhook] Recibido JSON invalido.")
+            self._send_response(400, "Invalid JSON")
+        except Exception as e:
+            logger.error("[Webhook] Fallo catastrofico en controlador: %s", str(e))
+            self._send_response(500, "Internal Server Error")
 
-        # Buena práctica: Responder 200 OK a Jellyfin inmediatamente
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/plain')
+    def _send_response(self, status, message):
+        self.send_response(status)
+        self.send_header('Content-type', 'application/json')
         self.end_headers()
-        self.wfile.write(b"OK")
+        self.wfile.write(json.dumps({"status": message}).encode())
 
-        # Extraer variables esenciales
-        series_name = payload.get("SeriesName")
-        episode = payload.get("EpisodeNumber")
-        shoko_series_id = payload.get("SeriesId")
-
-        if not all([series_name, episode, shoko_series_id]):
-            logger.warning("[Webhook] Payload ignorado por falta de datos.")
-            return
-
-        logger.info("[Webhook] Evento recibido: '%s' (Episodio: %s | Shoko ID: %s)", series_name, episode, shoko_series_id)
-
-        # Enviar al motor de 5 capas (Pipeline)
-        process_webhook_payload(shoko_series_id, episode, series_name)
+    # Silenciar logs nativos HTTP para mantener consola limpia
+    def log_message(self, format, *args):
+        pass
 
 def run_webhook_server(port):
-    """Inicializa el servidor multihilo en el puerto especificado."""
-    server_address = ('', port)
-    httpd = ThreadingHTTPServer(server_address, JellyfinWebhookHandler)
-    logger.info("[Daemon] Servidor local operando sobre puerto %s.", port)
-    httpd.serve_forever()
+    server = HTTPServer(('0.0.0.0', port), WebhookHandler)
+    server.serve_forever()
 

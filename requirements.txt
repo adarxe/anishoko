@@ -1,5 +1,3 @@
 requests
 python-dotenv
 rapidfuzz
-duckdb
-

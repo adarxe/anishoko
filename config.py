@@ -14,10 +14,10 @@ load_dotenv(dotenv_path=ENV_PATH)
 ANILIST_TOKEN = os.getenv("ANILIST_TOKEN", "").strip()
 SHOKO_URL = os.getenv("SHOKO_URL", "http://localhost:8111").rstrip('/')
 SHOKO_API_KEY = os.getenv("SHOKO_API_KEY", "").strip()
-PORT = int(os.getenv("PORT", "5001"))
+PORT = int(os.getenv("PORT", "5000"))
 
 # Archivos de datos
-DB_FILE = BASE_DIR / "shoko_sync.duckdb"
+DB_FILE = BASE_DIR / "shoko_sync.db"
 SYNC_SCRIPT_NAME = "fetch_anilist_mirror.py"
 
 # Configuración centralizada de Logging

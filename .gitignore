@@ -6,6 +6,7 @@
 *.duckdb
 duckdb/
 duckdb.wal
+*.db
 
 # Ignorar archivos temporales y caché
 __pycache__/

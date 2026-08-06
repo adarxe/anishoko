@@ -11,7 +11,7 @@ logger = logging.getLogger("ShokoAniSync")
 if __name__ == '__main__':
     logger.info("[System] Booting Shoko-AniList Sync Daemon (Clean Architecture)...")
 
-    # 1. Inicializar la base de datos DuckDB y migraciones
+    # 1. Inicializar la base de datos SQLite y migraciones
     try:
         init_db()
         logger.info("[System] Database subsystem initialized successfully.")
@@ -19,11 +19,11 @@ if __name__ == '__main__':
         logger.critical("[System] Fatal error during database initialization: %s", str(e))
         exit(1)
 
-    # 2. Iniciar Worker de Sincronización Diaria (Espejo de AniList)
+    # 2. Iniciar Worker de Sincronizacion Diaria (Espejo de AniList)
     logger.info("[System] Spawning Daily Sync Worker thread.")
     threading.Thread(target=daily_sync_worker, daemon=True).start()
 
-    # 3. Iniciar Worker Conserje (Gestión de Cola Offline/Reintentos)
+    # 3. Iniciar Worker Conserje (Gestion de Cola Offline/Reintentos)
     logger.info("[System] Spawning Offline Queue Manager (Conserje) thread.")
     threading.Thread(target=offline_living_worker, daemon=True).start()
 
