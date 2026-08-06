@@ -69,7 +69,9 @@ def process_webhook_payload(shoko_series_id, episode, series_name, item_name="")
         logger.info("[Pipeline] Capa 1 superada -> Mapeo L1 encontrado: AniList ID %s", anilist_id)
         success = post_to_anilist(anilist_id, episode)
         if not success:
+            logger.warning("[Pipeline] Fallo mutacion en Capa 1 (Red/DNS). Encolando tarea offline.")
             add_to_queue(shoko_series_id, anilist_id, episode, queue_query, series_name)
+            return False
         return True
 
     # --------------------------------------------------------
