@@ -18,7 +18,6 @@ PORT = int(os.getenv("PORT", "5000"))
 
 # Archivos de datos
 DB_FILE = BASE_DIR / "shoko_sync.db"
-SYNC_SCRIPT_NAME = "fetch_anilist_mirror.py"
 
 # Configuración centralizada de Logging
 logging.basicConfig(

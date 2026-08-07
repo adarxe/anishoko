@@ -94,9 +94,11 @@ def offline_living_worker():
                     shoko_id = task["shoko_series_id"]
                     ep = task["episode"]
                     s_name = task["series_name"]
+                    # Extraemos el item_name guardado asincronamente en search_query
+                    item_name = task.get("search_query") or s_name
 
-                    # Intentamos procesar a traves de la tuberia principal
-                    success = process_webhook_payload(shoko_id, ep, s_name, item_name=s_name)
+                    # Intentamos procesar a traves de la tuberia principal conservando el item_name
+                    success = process_webhook_payload(shoko_id, ep, s_name, item_name=item_name)
 
                     if success:
                         remove_from_queue(q_id)

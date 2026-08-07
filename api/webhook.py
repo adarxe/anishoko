@@ -1,7 +1,7 @@
 import json
 import logging
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from services.pipeline import process_webhook_payload
+from database.repository import add_to_queue
 
 logger = logging.getLogger("ShokoAniSync")
 
@@ -15,65 +15,54 @@ class WebhookHandler(BaseHTTPRequestHandler):
         try:
             payload = json.loads(post_data.decode('utf-8'))
             
-            # ----------------------------------------------------
-            # FILTRO 1: Tipo de evento
-            # ----------------------------------------------------
+            # 1. Filtro: Tipo de evento
             if payload.get("NotificationType") != "PlaybackStop":
                 self._send_response(200, "Ignored: Not PlaybackStop")
                 return
 
-            # ----------------------------------------------------
-            # FILTRO 2: Detección de Contenido Occidental (Non-Anime)
-            # ----------------------------------------------------
+            # 2. Filtro: Contenido Occidental / Non-Shoko
             provider_ids = payload.get("ProviderIds", {})
             shoko_series_id = payload.get("SeriesId") or provider_ids.get("Shoko Series") or provider_ids.get("Shoko")
-
-            # Si contiene identificadores explícitos occidentales o carece del ID de Shoko, es occidental
             has_western_provider = any(k in provider_ids for k in ["Imdb", "Tvdb", "Tmdb", "IMDb", "TVDb", "TMDb"])
             
             if not shoko_series_id or (has_western_provider and not shoko_series_id):
-                logger.info("[Webhook] Evento descartado: Contenido no gestionado por Shoko (Serie occidental / Pelicula no-anime)")
+                logger.info("[Webhook] Evento descartado: Contenido no gestionado por Shoko.")
                 self._send_response(200, "Ignored: Non-Shoko content")
                 return
 
-            # ----------------------------------------------------
-            # FILTRO 3: Umbral de reproducción (Porcentaje)
-            # ----------------------------------------------------
+            # 3. Filtro: Umbral de reproduccion (85%)
             played_to_completion = payload.get("PlayedToCompletion", False)
             position_ticks = payload.get("PlaybackPositionTicks") or payload.get("PositionTicks") or 0
             runtime_ticks = payload.get("RunTimeTicks") or 0
-            
             played_pct = (position_ticks / runtime_ticks * 100.0) if runtime_ticks > 0 else 0.0
 
             if not played_to_completion and played_pct < MIN_PLAYBACK_PERCENTAGE:
-                logger.info(
-                    "[Webhook] Evento omitido: Reproduccion incompleta (Completado: %s | Progreso: %.1f%%)", 
-                    played_to_completion, played_pct
-                )
+                logger.info("[Webhook] Evento omitido: Reproduccion incompleta (%.1f%%)", played_pct)
                 self._send_response(200, "Ignored: Playback threshold not met")
                 return
 
-            # ----------------------------------------------------
-            # EXTRACCIÓN DE DATOS Y ENVÍO AL PIPELINE
-            # ----------------------------------------------------
+            # Extraccion de datos
             episode = payload.get("EpisodeNumber")
             series_name = payload.get("SeriesName", "")
-            item_name = payload.get("Name", "")
+            item_name = payload.get("Name", "") or series_name
 
             if not episode:
                 logger.warning("[Webhook] Payload incompleto: Falta numero de episodio.")
                 self._send_response(400, "Missing episode number")
                 return
 
-            logger.info("[Webhook] Evento validado: '%s' (Ep: %s | Progreso: %.1f%%)", series_name, episode, played_pct)
-            process_webhook_payload(shoko_series_id, episode, series_name, item_name)
-            self._send_response(200, "Event Queued for Pipeline")
+            # Encolado asincrono directo en SQLite (< 2ms)
+            add_to_queue(shoko_series_id, 0, episode, search_query=item_name, series_name=series_name)
+            logger.info("[Webhook] Evento validado y encolado: '%s' (Ep: %s | Progreso: %.1f%%)", series_name, episode, played_pct)
+            
+            # Respuesta 200 OK inmediata
+            self._send_response(200, "Event Queued Successfully")
 
         except json.JSONDecodeError:
             logger.error("[Webhook] Recibido JSON invalido.")
             self._send_response(400, "Invalid JSON")
         except Exception as e:
-            logger.error("[Webhook] Fallo en controlador webhook: %s", str(e))
+            logger.error("[Webhook] Error en controlador webhook: %s", str(e))
             self._send_response(500, "Internal Server Error")
 
     def _send_response(self, status, message):
@@ -88,4 +77,3 @@ class WebhookHandler(BaseHTTPRequestHandler):
 def run_webhook_server(port):
     server = HTTPServer(('0.0.0.0', port), WebhookHandler)
     server.serve_forever()
-
