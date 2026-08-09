@@ -84,18 +84,6 @@ def save_mapping(shoko_series_id, episode, anilist_id, search_query, romaji_name
                 last_updated = CURRENT_TIMESTAMP
         ''', (shoko_series_id, episode, anilist_id, search_query, romaji_name))
 
-def update_mirror_local_watch(anilist_id, episode_watched, user_status="CURRENT"):
-    """Actualiza la obra en el espejo local registrando la fecha de reproduccion local exacta."""
-    with get_connection() as conn:
-        conn.execute('''
-            UPDATE anilist_mirror 
-            SET episodes_watched = ?, 
-                user_status = ?, 
-                last_watched_at = CURRENT_TIMESTAMP
-            WHERE anilist_id = ?
-        ''', (episode_watched, user_status, anilist_id))
-
-
 def add_to_watch_history(anilist_id, episode, shoko_series_id=""):
     """Registra una entrada inmutable en el historial cronológico de reproducción (Event Sourcing)."""
     with get_connection() as conn:
