@@ -11,9 +11,8 @@ def get_connection():
     return conn
 
 def init_db():
-    """Inicializa todas las tablas y realiza migraciones de columnas si no existen."""
+    """Inicializa tablas y migra la columna repeat_count si no existe."""
     with get_connection() as conn:
-        # 1. Tabla Mirror
         conn.execute('''
             CREATE TABLE IF NOT EXISTS anilist_mirror (
                 anilist_id INTEGER PRIMARY KEY,
@@ -25,8 +24,20 @@ def init_db():
                 user_status VARCHAR,
                 episodes_watched INTEGER,
                 total_episodes INTEGER,
+                repeat_count INTEGER DEFAULT 0,
                 last_synced TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_watched_at TIMESTAMP
+            )
+        ''')
+        
+	# 1.5. Tabla Watch History (Historial inmutable de reproducciones)
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS watch_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                anilist_id INTEGER NOT NULL,
+                shoko_series_id TEXT,
+                episode INTEGER NOT NULL,
+                watched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
 
@@ -66,10 +77,8 @@ def init_db():
             )
         ''')
 
-        # Migraciones preventivas para bases de datos existentes
-        for table, col in [("anilist_mirror", "last_watched_at"), ("series_mapping", "last_watched_at")]:
-            try:
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} TIMESTAMP")
-            except Exception:
-                pass
-
+         # Migración defensiva para bases de datos SQLite en marcha
+        try:
+            conn.execute("ALTER TABLE anilist_mirror ADD COLUMN repeat_count INTEGER DEFAULT 0;")
+        except Exception:
+            pass  # La columna ya existe

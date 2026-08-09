@@ -5,7 +5,12 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from config import ANILIST_TOKEN
 from database.connection import get_connection
-from database.repository import get_cached_relations, save_cached_relations
+from database.repository import (
+    get_cached_relations, 
+    save_cached_relations,
+    update_mirror_local_watch,
+    add_to_watch_history
+)
 
 logger = logging.getLogger("ShokoAniSync")
 
@@ -155,84 +160,115 @@ def fetch_franchise_relations_bfs(base_anilist_id):
     return discovered_anime
 
 
-def post_to_anilist(anilist_id, raw_target_episode, format_type="TV"):
-    """Envia la mutacion de actualizacion a AniList validando la idempotencia local."""
+def post_to_anilist(anilist_id, raw_target_episode, format_type="TV", shoko_series_id=""):
+    """Envia mutaciones a AniList respetando el contador de rewatch de AniList Web."""
     target_episode = int(raw_target_episode)
-    target_status = "CURRENT"
-
+    
     with get_connection() as conn:
-        row = conn.execute("SELECT episodes_watched, total_episodes FROM anilist_mirror WHERE anilist_id = ?", (anilist_id,)).fetchone()
-        
+        row = conn.execute(
+            "SELECT episodes_watched, total_episodes, user_status, repeat_count FROM anilist_mirror WHERE anilist_id = ?",
+            (anilist_id,)
+        ).fetchone()
+
         if row:
-            current_watched, total_episodes = row
+            current_watched, total_episodes, user_status, repeat_count = row
+            repeat_count = repeat_count or 0
         else:
             api_format, api_episodes, api_status, t_romaji, t_english, api_mal_id = fetch_media_info_from_anilist(anilist_id)
             if not api_format:
                 return False
-            
+
             total_episodes = api_episodes or 999
             format_type = api_format
             current_watched = 0
-            
+            user_status = "PLANNING"
+            repeat_count = 0
+
             conn.execute('''
-                INSERT INTO anilist_mirror (anilist_id, mal_id, title_romaji, title_english, format, status, user_status, episodes_watched, total_episodes)
-                VALUES (?, ?, ?, ?, ?, ?, 'PLANNING', 0, ?)
+                INSERT INTO anilist_mirror (anilist_id, mal_id, title_romaji, title_english, format, status, user_status, episodes_watched, total_episodes, repeat_count)
+                VALUES (?, ?, ?, ?, ?, ?, 'PLANNING', 0, ?, 0)
             ''', (anilist_id, api_mal_id, t_romaji, t_english, format_type, api_status or "FINISHED", total_episodes))
 
-    if format_type in ["MOVIE", "SPECIAL", "ONE_SHOT"] or total_episodes == 1:
+    is_completed_previously = (user_status == "COMPLETED")
+    is_currently_rewatching = (user_status == "REPEATING")
+    is_single_entry = (format_type in ["MOVIE", "SPECIAL", "ONE_SHOT"] or total_episodes == 1)
+
+    target_status = user_status
+    target_repeat = repeat_count
+
+    # --- MÁQUINA DE ESTADOS REWATCH ---
+    
+    # CASO A: Película u OVA previamente COMPLETADA (Suma +1 de inmediato)
+    if is_completed_previously and is_single_entry:
         target_episode = 1
         target_status = "COMPLETED"
-    
-    if total_episodes and target_episode >= total_episodes:
+        target_repeat = repeat_count + 1
+        logger.info("[Rewatch] Película/OVA completada nuevamente. Incrementando rewatch a %s", target_repeat)
+
+    # CASO B: Inicio de Rewatch en Serie (Cualquier episodio visto en obra COMPLETADA)
+    elif is_completed_previously:
+        logger.info("[Rewatch] Inicio de re-visualizacion detectado. Estado: COMPLETED -> REPEATING")
+        target_status = "REPEATING"
+        current_watched = 0  # Desactivamos el bloqueo de idempotencia para la nueva ronda
+
+    # CASO C: En curso de Rewatch
+    elif is_currently_rewatching:
+        target_status = "REPEATING"
+
+    # CASO D: Finalización de serie en Rewatch o primera vez
+    if not is_single_entry and total_episodes and target_episode >= total_episodes:
         target_episode = total_episodes
         target_status = "COMPLETED"
+        if is_currently_rewatching:
+            target_repeat = repeat_count + 1
+            logger.info("[Rewatch] Serie completada en Rewatch! Contador incrementado a %s", target_repeat)
 
-    if target_episode <= current_watched:
+    # --- VALIDACIÓN DE IDEMPOTENCIA ---
+    # Se aplica solo en primera vez o durante rewatch si llega un ep menor al ya visto en esta ronda
+    if not (is_completed_previously and is_single_entry) and not (is_completed_previously and not is_currently_rewatching) and target_episode <= current_watched and user_status == target_status:
         logger.info("[Validation] Mutacion cancelada (Idempotencia): ID %s | Objetivo (%s) <= Actual (%s)", anilist_id, target_episode, current_watched)
         return True
 
+    # --- MUTACIÓN GRAPHQL CON PARÁMETRO REPEAT PROTEGIDO ---
     query = '''
-    mutation ($mediaId: Int, $progress: Int, $status: MediaListStatus) {
-      SaveMediaListEntry (mediaId: $mediaId, progress: $progress, status: $status) {
+    mutation ($mediaId: Int, $progress: Int, $status: MediaListStatus, $repeat: Int) {
+      SaveMediaListEntry (mediaId: $mediaId, progress: $progress, status: $status, repeat: $repeat) {
         id
         status
         progress
+        repeat
       }
     }
     '''
-    
+
     payload = {
         'query': query,
         'variables': {
             'mediaId': int(anilist_id),
             'progress': int(target_episode),
-            'status': target_status
+            'status': target_status,
+            'repeat': int(target_repeat)
         }
     }
 
     try:
-        # Cabeceras omitidas explicitamente; son gestionadas por requests.Session()
-        res = session.post(
-            'https://graphql.anilist.co',
-            json=payload,
-            timeout=10
-        )
+        res = session.post('https://graphql.anilist.co', json=payload, timeout=10)
         if res.status_code == 200:
-            logger.info("[AniListClient] Mutacion exitosa: ID %s -> Progreso: %s | Estado: %s", anilist_id, target_episode, target_status)
+            logger.info("[AniListClient] Mutacion exitosa: ID %s -> Progreso: %s | Estado: %s | Repeticiones: %s", 
+                        anilist_id, target_episode, target_status, target_repeat)
             try:
-                with get_connection() as conn:
-                    conn.execute("UPDATE anilist_mirror SET episodes_watched = ?, user_status = ? WHERE anilist_id = ?", (target_episode, target_status, anilist_id))
+                update_mirror_local_watch(anilist_id, target_episode, target_status, target_repeat)
+                add_to_watch_history(anilist_id, target_episode, shoko_series_id)
             except Exception as db_err:
-                logger.error("[Database] Error actualizando estado de espejo local: %s", str(db_err))
+                logger.error("[Database] Error actualizando estado de espejo o historial: %s", str(db_err))
             return True
         else:
             logger.error("[AniListClient] Rechazo de mutacion: HTTP %s - %s", res.status_code, res.text)
             return False
-            
+
     except requests.exceptions.RequestException as e:
         logger.error("[AniListClient] Fallo de conexion en mutacion: %s", str(e))
         return False
-
 
 def resolve_title_smart(clean_title):
     """Busca el titulo en AniList mediante GraphQL y retorna su ID y formato."""

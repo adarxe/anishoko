@@ -2,6 +2,7 @@ import json
 import logging
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from database.repository import add_to_queue
+from services.conserje import notify_new_task
 
 logger = logging.getLogger("ShokoAniSync")
 
@@ -55,7 +56,10 @@ class WebhookHandler(BaseHTTPRequestHandler):
             add_to_queue(shoko_series_id, 0, episode, search_query=item_name, series_name=series_name)
             logger.info("[Webhook] Evento validado y encolado: '%s' (Ep: %s | Progreso: %.1f%%)", series_name, episode, played_pct)
             
-            # Respuesta 200 OK inmediata
+            # ¡Despertamos al Conserje inmediatamente!
+            notify_new_task()
+
+            # Respuesta 200 OK inmediata a Jellyfin
             self._send_response(200, "Event Queued Successfully")
 
         except json.JSONDecodeError:
@@ -77,3 +81,4 @@ class WebhookHandler(BaseHTTPRequestHandler):
 def run_webhook_server(port):
     server = HTTPServer(('0.0.0.0', port), WebhookHandler)
     server.serve_forever()
+

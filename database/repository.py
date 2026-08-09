@@ -24,14 +24,21 @@ def find_anilist_id_in_mirror_by_title(clean_title):
     return None
 
 def get_cached_relations(base_anilist_id):
+    """Obtiene el arbol relacional solo si la cache tiene menos de 7 dias (168h)."""
     with get_connection() as conn:
-        row = conn.execute("SELECT related_ids_json FROM relations_cache WHERE base_anilist_id = ?", (base_anilist_id,)).fetchone()
+        row = conn.execute('''
+            SELECT related_ids_json 
+            FROM relations_cache 
+            WHERE base_anilist_id = ? 
+              AND cached_at >= datetime('now', '-7 days')
+        ''', (base_anilist_id,)).fetchone()
+        
         if row:
             try:
                 return json.loads(row[0])
             except json.JSONDecodeError:
                 return []
-        return None
+    return None
 
 def save_cached_relations(base_anilist_id, related_ids):
     with get_connection() as conn:
@@ -53,6 +60,18 @@ def get_mapping(shoko_series_id, episode):
             return row[0]
         return None
 
+def update_mirror_local_watch(anilist_id, episode_watched, user_status="CURRENT", repeat_count=0):
+    """Actualiza el progreso, estado y contador de rewatch en el espejo local."""
+    with get_connection() as conn:
+        conn.execute('''
+            UPDATE anilist_mirror 
+            SET episodes_watched = ?, 
+                user_status = ?, 
+                repeat_count = ?,
+                last_watched_at = CURRENT_TIMESTAMP
+            WHERE anilist_id = ?
+        ''', (episode_watched, user_status, repeat_count, anilist_id))
+
 def save_mapping(shoko_series_id, episode, anilist_id, search_query, romaji_name):
     with get_connection() as conn:
         conn.execute('''
@@ -64,6 +83,26 @@ def save_mapping(shoko_series_id, episode, anilist_id, search_query, romaji_name
                 romaji_name = EXCLUDED.romaji_name,
                 last_updated = CURRENT_TIMESTAMP
         ''', (shoko_series_id, episode, anilist_id, search_query, romaji_name))
+
+def update_mirror_local_watch(anilist_id, episode_watched, user_status="CURRENT"):
+    """Actualiza la obra en el espejo local registrando la fecha de reproduccion local exacta."""
+    with get_connection() as conn:
+        conn.execute('''
+            UPDATE anilist_mirror 
+            SET episodes_watched = ?, 
+                user_status = ?, 
+                last_watched_at = CURRENT_TIMESTAMP
+            WHERE anilist_id = ?
+        ''', (episode_watched, user_status, anilist_id))
+
+
+def add_to_watch_history(anilist_id, episode, shoko_series_id=""):
+    """Registra una entrada inmutable en el historial cronológico de reproducción (Event Sourcing)."""
+    with get_connection() as conn:
+        conn.execute('''
+            INSERT INTO watch_history (anilist_id, episode, shoko_series_id)
+            VALUES (?, ?, ?)
+        ''', (anilist_id, episode, shoko_series_id))
 
 # ==========================================
 # GESTIÓN DE COLA (Workers)
