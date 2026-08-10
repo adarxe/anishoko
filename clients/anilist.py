@@ -113,7 +113,7 @@ def fetch_franchise_relations_bfs(base_anilist_id):
     queue = [base_anilist_id]
     discovered_anime = []
 
-    while queue and len(visited) < 30:  # Limite preventivo de nodos
+    while queue and len(visited) < 50:  # Limite preventivo de nodos
         current_id = queue.pop(0)
         if current_id in visited:
             continue
@@ -271,7 +271,28 @@ def post_to_anilist(anilist_id, raw_target_episode, format_type="TV", shoko_seri
         return False
 
 def resolve_title_smart(clean_title):
-    """Busca el titulo en AniList mediante GraphQL y retorna su ID y formato."""
+    """
+    Busca el título en AniList mediante GraphQL utilizando una estrategia 
+    de búsqueda escalonada (fallback de términos) para obtener una semilla.
+    """
+    candidates = [clean_title]
+    
+    # 1. Recorte por delimitadores comunes (ej: "Nekomonogatari (Kuro): Tsubasa..." -> "Nekomonogatari")
+    for delim in [':', '-', '(']:
+        if delim in clean_title:
+            base = clean_title.split(delim)[0].strip()
+            if base and base not in candidates:
+                candidates.append(base)
+                
+    # 2. Recorte de sub-títulos o cadenas largas
+    words = clean_title.split()
+    if len(words) > 2:
+        two_words = " ".join(words[:2])
+        if two_words not in candidates:
+            candidates.append(two_words)
+        if words[0] not in candidates:
+            candidates.append(words[0])
+
     query = '''
     query ($search: String) {
       Media (search: $search, type: ANIME) {
@@ -280,17 +301,23 @@ def resolve_title_smart(clean_title):
       }
     }
     '''
-    try:
-        res = session.post(
-            'https://graphql.anilist.co',
-            json={'query': query, 'variables': {'search': clean_title}},
-            timeout=10
-        )
-        if res.status_code == 200:
-            media = res.json().get("data", {}).get("Media")
-            if media:
-                return media["id"], media["format"]
-    except requests.exceptions.RequestException as e:
-        logger.error("[SmartResolver] Error de red resolviendo titulo: %s", str(e))
+    
+    for candidate in candidates:
+        if not candidate or len(candidate) < 2:
+            continue
+        try:
+            res = session.post(
+                'https://graphql.anilist.co',
+                json={'query': query, 'variables': {'search': candidate}},
+                timeout=10
+            )
+            time.sleep(0.3)  # Rate limit padding
+            if res.status_code == 200:
+                media = res.json().get("data", {}).get("Media")
+                if media:
+                    logger.info("[SmartResolver] Semilla localizada con término: '%s' -> ID AniList: %s", candidate, media["id"])
+                    return media["id"], media["format"]
+        except requests.exceptions.RequestException as e:
+            logger.error("[SmartResolver] Error de red resolviendo término ('%s'): %s", candidate, str(e))
+            
     return None, "TV"
-

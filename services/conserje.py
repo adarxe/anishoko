@@ -3,6 +3,12 @@ import logging
 import threading
 from database.connection import get_connection
 from services.pipeline import process_webhook_payload
+from services.pipeline import (
+    process_webhook_payload,
+    STATUS_SUCCESS,
+    STATUS_UNRESOLVED,
+    STATUS_NETWORK_ERROR
+)
 
 logger = logging.getLogger("ShokoAniSync")
 
@@ -71,19 +77,12 @@ def remove_from_queue(queue_id):
         conn.execute("DELETE FROM queue WHERE id = ?", (queue_id,))
 
 def offline_living_worker():
-    """
-    Worker demonio que procesa la cola:
-    - En condiciones normales: ejecuta al instante y entra en espera indefinida (0% CPU).
-    - En caso de error de red/DNS: reintenta cada 60 segundos.
-    """
-    logger.info("[Conserje] Worker de gestion de cola offline iniciado.")
+    """Worker demonio que procesa y limpia la cola según el resultado real."""
+    logger.info("[Conserje] Worker de gestión de cola offline iniciado.")
     
     while True:
         try:
-            # 1. Limpiamos la señal antes de leer SQLite para no perder eventos entrantes
             task_event.clear()
-            
-            # 2. Leemos la cola consolidada
             compacted_tasks = get_and_compact_pending_queue()
             all_succeeded = True
 
@@ -97,29 +96,31 @@ def offline_living_worker():
                     s_name = task["series_name"]
                     item_name = task.get("search_query") or s_name
 
-                    # Intento de procesamiento en las 5 capas
-                    success = process_webhook_payload(shoko_id, ep, s_name, item_name=item_name)
+                    # Evaluamos resultado
+                    result = process_webhook_payload(shoko_id, ep, s_name, item_name=item_name)
 
-                    if success:
-                        # Se elimina de SQLite SOLO si tuvo éxito la mutación HTTP
+                    if result == STATUS_SUCCESS:
                         remove_from_queue(q_id)
                         logger.info("[Conserje] Tarea ID %s completada y eliminada de la cola.", q_id)
-                    else:
+                        
+                    elif result == STATUS_UNRESOLVED:
+                        # Título no localizado: Se borra para evitar bucle infinito y logs falsos
+                        remove_from_queue(q_id)
+                        logger.warning("[Conserje] Tarea ID %s descartada: No se encontró id en AniList.", q_id)
+                        
+                    elif result == STATUS_NETWORK_ERROR:
+                        # Error de red/DNS real: Se conserva en cola para reintentar
                         all_succeeded = False
-                        logger.warning("[Conserje] Tarea ID %s fallo (Red/DNS). Permanece en cola.", q_id)
+                        logger.warning("[Conserje] Tarea ID %s falló por red/conectividad. Permanece en cola.", q_id)
 
-                # Si falló alguna tarea por red, dormimos 60 segundos para reintentar
                 if not all_succeeded:
-                    logger.info("[Conserje] Falla detectada en la cola. Reintentando en 60 segundos...")
+                    logger.info("[Conserje] Fallos de red detectados. Reintentando en 60 segundos...")
                     task_event.wait(timeout=60)
                     continue
 
-            # Si la cola está vacía o todo se procesó con éxito:
-            # Dormimos INDEFINIDAMENTE hasta que webhook.py llame a notify_new_task()
             if not compacted_tasks or all_succeeded:
                 task_event.wait()
 
         except Exception as e:
-            logger.error("[Conserje] Excepcion no controlada en bucle de cola: %s", str(e))
+            logger.error("[Conserje] Excepción no controlada en bucle de cola: %s", str(e))
             time.sleep(60)
-

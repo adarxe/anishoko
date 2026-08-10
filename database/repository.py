@@ -53,12 +53,22 @@ def save_cached_relations(base_anilist_id, related_ids):
 # ==========================================
 # MAPEO DIRECTO (Caché L1)
 # ==========================================
-def get_mapping(shoko_series_id, episode):
+def get_mapping(shoko_series_id, episode=None):
+    """
+    Obtiene el AniList ID de Caché L1 a nivel serie siempre que no haya expirado (TTL de 30 días).
+    """
     with get_connection() as conn:
-        row = conn.execute("SELECT anilist_id FROM series_mapping WHERE shoko_series_id = ? AND episode = ?", (shoko_series_id, episode)).fetchone()
+        row = conn.execute('''
+            SELECT anilist_id 
+            FROM series_mapping 
+            WHERE shoko_series_id = ? 
+              AND last_updated >= datetime('now', '-30 days')
+            LIMIT 1
+        ''', (shoko_series_id,)).fetchone()
+        
         if row:
             return row[0]
-        return None
+    return None
 
 def update_mirror_local_watch(anilist_id, episode_watched, user_status="CURRENT", repeat_count=0):
     """Actualiza el progreso, estado y contador de rewatch en el espejo local."""
@@ -73,6 +83,7 @@ def update_mirror_local_watch(anilist_id, episode_watched, user_status="CURRENT"
         ''', (episode_watched, user_status, repeat_count, anilist_id))
 
 def save_mapping(shoko_series_id, episode, anilist_id, search_query, romaji_name):
+    """Guarda o renueva el timestamp del mapeo L1 para refrescar el TTL."""
     with get_connection() as conn:
         conn.execute('''
             INSERT INTO series_mapping (shoko_series_id, episode, anilist_id, search_query, romaji_name, last_updated)

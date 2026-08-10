@@ -5,13 +5,13 @@ from config import DB_FILE
 logger = logging.getLogger("ShokoAniSync")
 
 def get_connection():
-    # check_same_thread=False es vital para que los hilos web y workers usen la DB
-    conn = sqlite3.connect(str(DB_FILE), check_same_thread=False)
+    # timeout=20.0 evita bloqueos cuando el CronSync y el Webhook escriben simultáneamente
+    conn = sqlite3.connect(str(DB_FILE), timeout=20.0, check_same_thread=False)
     conn.execute('PRAGMA journal_mode=WAL;') 
     return conn
 
 def init_db():
-    """Inicializa tablas y migra la columna repeat_count si no existe."""
+    """Inicializa tablas y asegura tipos de datos correctos."""
     with get_connection() as conn:
         conn.execute('''
             CREATE TABLE IF NOT EXISTS anilist_mirror (
@@ -29,8 +29,7 @@ def init_db():
                 last_watched_at TIMESTAMP
             )
         ''')
-        
-	# 1.5. Tabla Watch History (Historial inmutable de reproducciones)
+
         conn.execute('''
             CREATE TABLE IF NOT EXISTS watch_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,10 +40,10 @@ def init_db():
             )
         ''')
 
-        # 2. Tabla Mapeo (Caché L1)
+        # CAMBIO: shoko_series_id pasa de INTEGER a TEXT
         conn.execute('''
             CREATE TABLE IF NOT EXISTS series_mapping (
-                shoko_series_id INTEGER,
+                shoko_series_id TEXT,
                 episode INTEGER,
                 anilist_id INTEGER,
                 search_query VARCHAR,
@@ -55,7 +54,6 @@ def init_db():
             )
         ''')
 
-        # 3. Tabla Caché de Relaciones de Franquicias (Caché BFS)
         conn.execute('''
             CREATE TABLE IF NOT EXISTS relations_cache (
                 base_anilist_id INTEGER PRIMARY KEY,
@@ -64,11 +62,11 @@ def init_db():
             )
         ''')
 
-        # 4. Tabla Cola de Eventos Pendientes (Offline)
+        # CAMBIO: shoko_series_id pasa de INTEGER a TEXT
         conn.execute('''
             CREATE TABLE IF NOT EXISTS queue (
                 id INTEGER PRIMARY KEY,
-                shoko_series_id INTEGER,
+                shoko_series_id TEXT,
                 anilist_id INTEGER,
                 episode INTEGER,
                 search_query VARCHAR,
@@ -77,8 +75,8 @@ def init_db():
             )
         ''')
 
-         # Migración defensiva para bases de datos SQLite en marcha
         try:
             conn.execute("ALTER TABLE anilist_mirror ADD COLUMN repeat_count INTEGER DEFAULT 0;")
         except Exception:
-            pass  # La columna ya existe
+            pass
+

@@ -1,3 +1,4 @@
+import re
 import json
 import logging
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -21,12 +22,23 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 self._send_response(200, "Ignored: Not PlaybackStop")
                 return
 
-            # 2. Filtro: Contenido Occidental / Non-Shoko
+             # 2. Filtro y Extracción de ID de Shoko
             provider_ids = payload.get("ProviderIds", {})
-            shoko_series_id = payload.get("SeriesId") or provider_ids.get("Shoko Series") or provider_ids.get("Shoko")
+            provider_custom = payload.get("Provider_custom", "")
+            shoko_series_id = None
+
+            # Extraer ID numérico real desde Provider_custom (ej: seriesId=8)
+            match = re.search(r'seriesId=(\d+)', provider_custom)
+            if match:
+                shoko_series_id = match.group(1)
+
+            # Fallback: Extraer desde ProviderIds
+            if not shoko_series_id:
+                shoko_series_id = provider_ids.get("Shoko Series") or provider_ids.get("Shoko")
+
             has_western_provider = any(k in provider_ids for k in ["Imdb", "Tvdb", "Tmdb", "IMDb", "TVDb", "TMDb"])
-            
-            if not shoko_series_id or (has_western_provider and not shoko_series_id):
+
+            if not shoko_series_id or (has_western_provider and not match and not provider_ids.get("Shoko")):
                 logger.info("[Webhook] Evento descartado: Contenido no gestionado por Shoko.")
                 self._send_response(200, "Ignored: Non-Shoko content")
                 return

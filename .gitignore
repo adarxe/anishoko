@@ -1,6 +1,7 @@
 # Ignorar archivos del entorno y variables secretas
 .env
 .env.example
+*.xml
 
 # Ignorar archivos de base de datos
 *.duckdb
