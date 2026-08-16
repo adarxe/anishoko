@@ -1,7 +1,7 @@
 import re
 import json
 import logging
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from database.repository import add_to_queue
 from services.conserje import notify_new_task
 
@@ -16,69 +16,66 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
         try:
             payload = json.loads(post_data.decode('utf-8'))
-            
-            # 1. Filtro: Tipo de evento
+
             if payload.get("NotificationType") != "PlaybackStop":
                 self._send_response(200, "Ignored: Not PlaybackStop")
                 return
 
-             # 2. Filtro y Extracción de ID de Shoko
             provider_ids = payload.get("ProviderIds", {})
             provider_custom = payload.get("Provider_custom", "")
-            shoko_series_id = None
 
-            # Extraer ID numérico real desde Provider_custom (ej: seriesId=8)
-            match = re.search(r'seriesId=(\d+)', provider_custom)
-            if match:
-                shoko_series_id = match.group(1)
+            anidb_id = payload.get("Provider_anidb") or provider_ids.get("Anidb") or provider_ids.get("AniDB")
 
-            # Fallback: Extraer desde ProviderIds
-            if not shoko_series_id:
-                shoko_series_id = provider_ids.get("Shoko Series") or provider_ids.get("Shoko")
+            shoko_id = (
+                payload.get("Provider_shoko series") or
+                payload.get("Provider_shoko_series") or
+                provider_ids.get("Shoko Series") or
+                provider_ids.get("Shoko")
+            )
 
+            if not shoko_id and provider_custom:
+                match = re.search(r'seriesId=(\d+)', provider_custom)
+                if match:
+                    shoko_id = match.group(1)
+
+            has_shoko_marker = bool(shoko_id or re.search(r'seriesId=\d+', provider_custom) or provider_ids.get("Shoko Series") or provider_ids.get("Shoko"))
             has_western_provider = any(k in provider_ids for k in ["Imdb", "Tvdb", "Tmdb", "IMDb", "TVDb", "TMDb"])
 
-            if not shoko_series_id or (has_western_provider and not match and not provider_ids.get("Shoko")):
-                logger.info("[Webhook] Evento descartado: Contenido no gestionado por Shoko.")
-                self._send_response(200, "Ignored: Non-Shoko content")
+            if not anidb_id or (has_western_provider and not has_shoko_marker):
+                logger.info("[Webhook] Evento omitido: Contenido no gestionado por AniDB/Shoko.")
+                self._send_response(200, "Ignored: Non-AniDB content")
                 return
 
-            # 3. Filtro: Umbral de reproduccion (85%)
             played_to_completion = payload.get("PlayedToCompletion", False)
             position_ticks = payload.get("PlaybackPositionTicks") or payload.get("PositionTicks") or 0
             runtime_ticks = payload.get("RunTimeTicks") or 0
             played_pct = (position_ticks / runtime_ticks * 100.0) if runtime_ticks > 0 else 0.0
+            series_name = payload.get("SeriesName", "Desconocido")
 
             if not played_to_completion and played_pct < MIN_PLAYBACK_PERCENTAGE:
-                logger.info("[Webhook] Evento omitido: Reproduccion incompleta (%.1f%%)", played_pct)
+                logger.info("[Webhook] Evento omitido: Umbral incompleto (%.1f%%) en '%s'", played_pct, series_name)
                 self._send_response(200, "Ignored: Playback threshold not met")
                 return
 
-            # Extraccion de datos
             episode = payload.get("EpisodeNumber")
-            series_name = payload.get("SeriesName", "")
             item_name = payload.get("Name", "") or series_name
 
-            if not episode:
-                logger.warning("[Webhook] Payload incompleto: Falta numero de episodio.")
+            if episode is None:
+                logger.warning("[Webhook] Payload descartado: Falta número de episodio en '%s'.", series_name)
                 self._send_response(400, "Missing episode number")
                 return
 
-            # Encolado asincrono directo en SQLite (< 2ms)
-            add_to_queue(shoko_series_id, 0, episode, search_query=item_name, series_name=series_name)
-            logger.info("[Webhook] Evento validado y encolado: '%s' (Ep: %s | Progreso: %.1f%%)", series_name, episode, played_pct)
-            
-            # ¡Despertamos al Conserje inmediatamente!
-            notify_new_task()
+            add_to_queue(anidb_id, 0, episode, search_query=item_name, series_name=series_name, shoko_id=shoko_id)
+            logger.info("[Webhook] Evento encolado: '%s' (AniDB: %s | Shoko: %s | Ep: %s | Progreso: %.1f%%)", 
+                        series_name, anidb_id, shoko_id or "N/A", episode, played_pct)
 
-            # Respuesta 200 OK inmediata a Jellyfin
+            notify_new_task()
             self._send_response(200, "Event Queued Successfully")
 
         except json.JSONDecodeError:
-            logger.error("[Webhook] Recibido JSON invalido.")
             self._send_response(400, "Invalid JSON")
         except Exception as e:
-            logger.error("[Webhook] Error en controlador webhook: %s", str(e))
+            logger.error("[Webhook] Error crítico: %s", str(e), exc_info=True)
             self._send_response(500, "Internal Server Error")
 
     def _send_response(self, status, message):
@@ -91,6 +88,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
         pass
 
 def run_webhook_server(port):
-    server = HTTPServer(('0.0.0.0', port), WebhookHandler)
+    server = ThreadingHTTPServer(('0.0.0.0', port), WebhookHandler)
     server.serve_forever()
 

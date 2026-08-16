@@ -1,149 +1,149 @@
 import re
 import logging
 from rapidfuzz import fuzz
+
 from database.repository import (
     get_mapping, 
     save_mapping, 
-    add_to_queue,
     get_cached_relations,      
     save_cached_relations,
-    find_anilist_id_in_mirror_by_title  # ← AGREGAR ESTA LÍNEA
+    get_all_mirror_entries
 )
-from clients.shoko import fetch_anilist_id_from_shoko
+from clients.shoko import fetch_mal_id_from_shoko
 from clients.anilist import (
-    fetch_media_info_from_anilist,
     fetch_franchise_relations_bfs,
     post_to_anilist,
-    resolve_title_smart
+    resolve_title_smart,
+    get_anilist_id_by_mal
 )
 
 logger = logging.getLogger("ShokoAniSync")
 
-def get_franchise_relations_with_cache(anilist_id):
-    """
-    Obtiene relaciones de franquicia validando cache local.
-    Nota: El TTL de 7 dias debe ser gestionado por la query en repository.py.
-    """
-    logger.info("[Pipeline] Comprobando cache relacional para Base ID %s", anilist_id)
-    
-    try:
-        cached_data = get_cached_relations(anilist_id)
-        
-        if cached_data:
-            logger.info("[Pipeline] Acierto en cache relacional (Base ID %s)", anilist_id)
-            return cached_data
-        
-        logger.info("[Pipeline] Fallo en cache relacional. Descargando arbol desde AniList API...")
-        discovered_anime = fetch_franchise_relations_bfs(anilist_id)
-        
-        if discovered_anime:
-            save_cached_relations(anilist_id, discovered_anime)
-            logger.info("[Pipeline] Arbol relacional guardado en cache (Base ID %s)", anilist_id)
-        
-        return discovered_anime
-        
-    except Exception as e:
-        logger.error("[Pipeline] Excepcion en gestion de cache relacional: %s. Aplicando fallback de red.", str(e))
-        return fetch_franchise_relations_bfs(anilist_id)
-
-
-# Constantes de estado de resolución
 STATUS_SUCCESS = "SUCCESS"
 STATUS_UNRESOLVED = "UNRESOLVED"
 STATUS_NETWORK_ERROR = "NETWORK_ERROR"
+STATUS_REQUIRES_MANUAL = "REQUIRES_MANUAL"
 
-def process_webhook_payload(shoko_series_id, episode, series_name, item_name=""):
-    """
-    Orquesta las capas de resolución de AniList.
-    Devuelve: STATUS_SUCCESS, STATUS_UNRESOLVED o STATUS_NETWORK_ERROR.
-    """
-    clean_series_name = re.sub(r'[^a-zA-Z0-9\s]', '', series_name).strip()
-    queue_query = f"{clean_series_name} {episode}"
+def get_franchise_relations_with_cache(anilist_id):
+    try:
+        cached_data = get_cached_relations(anilist_id)
+        if cached_data: return cached_data
+        
+        discovered_anime = fetch_franchise_relations_bfs(anilist_id)
+        if discovered_anime:
+            save_cached_relations(anilist_id, discovered_anime)
+        return discovered_anime
+    except Exception as e:
+        logger.error("[Pipeline] Fallback de red en cache relacional: %s", str(e))
+        return fetch_franchise_relations_bfs(anilist_id)
+
+def resolve_with_bfs_relations(seed_id, search_title):
+    franchise_tree = get_franchise_relations_with_cache(seed_id)
+    if not franchise_tree: return None
+        
+    best_match_id = None
+    highest_score = 0
     
-    clean_item_name = re.sub(r'[^a-zA-Z0-9\s]', '', item_name).strip()
+    for node in franchise_tree:
+        node_id = node.get("id")
+        titles = node.get("title", {})
+        score_romaji = fuzz.WRatio(search_title.lower(), (titles.get("romaji") or "").lower())
+        score_english = fuzz.WRatio(search_title.lower(), (titles.get("english") or "").lower())
+        
+        max_node_score = max(score_romaji, score_english)
+        if max_node_score > highest_score:
+            highest_score = max_node_score
+            best_match_id = node_id
+            best_match_name = titles.get("romaji")
+            
+    if highest_score >= 85:
+        logger.info("[SmartResolver] Mejor coincidencia en BFS: '%s' (ID %s | Score: %s)", best_match_name, best_match_id, highest_score)
+        return best_match_id
+    return None
+
+def find_best_match_in_mirror(search_title):
+    """Busca en el espejo local usando token_sort_ratio para priorizar temporadas."""
+    entries = get_all_mirror_entries()
+    if not entries: return None
+
+    best_id = None
+    highest_score = 0
+
+    for anilist_id, t_romaji, t_english in entries:
+        score_romaji = fuzz.token_sort_ratio(search_title.lower(), (t_romaji or "").lower())
+        score_english = fuzz.token_sort_ratio(search_title.lower(), (t_english or "").lower())
+        
+        max_score = max(score_romaji, score_english)
+        if max_score > highest_score:
+            highest_score = max_score
+            best_id = anilist_id
+
+    if highest_score >= 80:
+        logger.info("[MirrorMatch] Coincidencia en Espejo Local: '%s' (ID %s | Score: %s)", search_title, best_id, highest_score)
+        return best_id
+    return None
+
+def process_webhook_payload(anidb_id, episode, series_name, item_name="", shoko_id=""):
+    """Orquesta la resolución Offline-First con la arquitectura de 4 capas."""
+    clean_series_name = re.sub(r'\b(19|20)\d{2}\b', '', series_name)
+    clean_series_name = re.sub(r'[^a-zA-Z0-9\s]', '', clean_series_name).strip()
+    
+    clean_item_name = re.sub(r'\b(19|20)\d{2}\b', '', item_name)
+    clean_item_name = re.sub(r'[^a-zA-Z0-9\s]', '', clean_item_name).strip()
+
+    queue_query = f"{clean_series_name} {episode}".strip()
     full_search_title = f"{clean_series_name} {clean_item_name}".strip()
-    
-    logger.info("[Pipeline] Iniciando resolución: Título='%s' | Item='%s' | Ep=%s | ShokoID=%s", 
-                series_name, item_name, episode, shoko_series_id)
 
-    # CAPA 1: Cache L1 con TTL
-    anilist_id = get_mapping(shoko_series_id, episode)
-    if anilist_id:
-        logger.info("[Pipeline] Capa 1 superada -> Mapeo L1 encontrado (TTL activo): AniList ID %s", anilist_id)
-        # Refrescamos el timestamp para extender la vida del mapeo
-        save_mapping(shoko_series_id, episode, anilist_id, queue_query, series_name)
-        if post_to_anilist(anilist_id, episode, shoko_series_id=shoko_series_id):
-            return STATUS_SUCCESS
-        logger.warning("[Pipeline] Fallo de red en mutación (Capa 1).")
-        return STATUS_NETWORK_ERROR
+    logger.info("[Pipeline] Resolviendo: Título='%s' | Ep=%s | AniDB_ID=%s | Shoko_ID=%s", series_name, episode, anidb_id, shoko_id or "N/A")
 
-    # CAPA 1.5: Cache Local en Mirror
-    anilist_id = find_anilist_id_in_mirror_by_title(full_search_title) or find_anilist_id_in_mirror_by_title(clean_series_name)
+    # PASO 1: Mapping L1 (0 ms) -> Requiere el episodio para la clave compuesta
+    anilist_id = get_mapping(anidb_id, episode)
     if anilist_id:
-        logger.info("[Pipeline] Capa 1.5 superada -> Serie encontrada en mirror: ID %s", anilist_id)
-        save_mapping(shoko_series_id, episode, anilist_id, queue_query, series_name)
-        if post_to_anilist(anilist_id, episode, shoko_series_id=shoko_series_id):
+        logger.info("[Pipeline] Paso 1 (Cache L1) superado -> ID %s", anilist_id)
+        if post_to_anilist(anilist_id, episode, anidb_id=anidb_id):
             return STATUS_SUCCESS
         return STATUS_NETWORK_ERROR
 
-    # CAPA 2: Bridge API Shoko
-    anilist_id = fetch_anilist_id_from_shoko(shoko_series_id)
+    # PASO 2: Espejo Local L2.5 (0 ms) -> Match por token_sort_ratio
+    anilist_id = find_best_match_in_mirror(full_search_title) or find_best_match_in_mirror(clean_series_name)
     if anilist_id:
-        logger.info("[Pipeline] Capa 2 superada -> ID resuelto vía Shoko Bridge: %s", anilist_id)
-    
-    # --------------------------------------------------------
-    # CAPA 3: SmartResolver Escalonado
-    # --------------------------------------------------------
-    if not anilist_id:
-        resolved_id, _ = resolve_title_smart(series_name)
-        if resolved_id:
-            anilist_id = resolved_id
-            logger.info("[Pipeline] Capa 3 superada -> SmartResolver localizó ID semilla: %s", anilist_id)
+        logger.info("[Pipeline] Paso 2 (Espejo Local) superado -> ID %s", anilist_id)
+        save_mapping(anidb_id, episode, anilist_id, queue_query, series_name)
+        if post_to_anilist(anilist_id, episode, anidb_id=anidb_id):
+            return STATUS_SUCCESS
+        return STATUS_NETWORK_ERROR
 
-    # Si tras la Capa 3 no logramos una semilla básica, se declara no resuelto
-    if not anilist_id:
-        logger.warning("[Pipeline] Imposible encontrar coincidencia o semilla para '%s'.", series_name)
+    # PASO 3: Shoko Bridge L2 (0 ms si está apagado) -> Solo consulta shoko_id
+    if shoko_id:
+        mal_id = fetch_mal_id_from_shoko(shoko_id)
+        if mal_id:
+            anilist_id = get_anilist_id_by_mal(mal_id)
+            if anilist_id:
+                logger.info("[Pipeline] Paso 3 (Shoko Bridge) superado -> ID %s", anilist_id)
+                save_mapping(anidb_id, episode, anilist_id, queue_query, series_name)
+                if post_to_anilist(anilist_id, episode, anidb_id=anidb_id):
+                    return STATUS_SUCCESS
+                return STATUS_NETWORK_ERROR
+
+    # PASO 4: GraphQL API L3/L3.5 (Último recurso online)
+    logger.info("[Pipeline] Paso 4 -> Iniciando búsqueda online en GraphQL...")
+    seed_result = resolve_title_smart(clean_series_name)
+    seed_id = seed_result[0] if isinstance(seed_result, tuple) else seed_result
+
+    if seed_id == "NETWORK_ERROR":
+        return STATUS_NETWORK_ERROR
+
+    if not seed_id:
         return STATUS_UNRESOLVED
 
-    # --------------------------------------------------------
-    # CAPA 3.5: Desambiguación Relacional Universal (BFS + RapidFuzz)
-    # --------------------------------------------------------
-    # Se ejecuta SIEMPRE para explorar la franquicia usando la semilla obtenida
-    logger.info("[Pipeline] Explorando árbol relacional BFS (Semilla Base ID %s)...", anilist_id)
-    discovered_anime = get_franchise_relations_with_cache(anilist_id)
-    
-    if discovered_anime:
-        best_match_id = anilist_id
-        highest_score = 0
-        
-        for anime in discovered_anime:
-            t_romaji = anime["title"].get("romaji", "")
-            t_english = anime["title"].get("english", "")
-            
-            # Evaluamos la similitud de la cadena completa contra cada nodo del árbol
-            score_romaji = fuzz.token_set_ratio(full_search_title, t_romaji)
-            score_english = fuzz.token_set_ratio(full_search_title, t_english)
-            max_score = max(score_romaji, score_english)
-            
-            if max_score > highest_score:
-                highest_score = max_score
-                best_match_id = anime["id"]
-                
-        if highest_score >= 75:  # Umbral de confianza
-            logger.info("[Pipeline] Desambiguación BFS exitosa: Coincidencia %s%% -> ID definitivo ajustado a %s", 
-                        round(highest_score, 2), best_match_id)
-            anilist_id = best_match_id
-        else:
-            logger.info("[Pipeline] Ningún nodo relacional superó el umbral (%s%%). Se conserva ID semilla %s.", 
-                        round(highest_score, 2), anilist_id)
+    anilist_id = resolve_with_bfs_relations(seed_id, full_search_title)
+    if not anilist_id:
+        logger.critical("[Pipeline] REQUIERE INTERVENCIÓN MANUAL para '%s'.", full_search_title)
+        return STATUS_REQUIRES_MANUAL
 
-    # --------------------------------------------------------
-    # CAPA 4: Ejecución Final y Guardado en Caché L1
-    # --------------------------------------------------------
-    save_mapping(shoko_series_id, episode, anilist_id, queue_query, series_name)
-    if post_to_anilist(anilist_id, episode, shoko_series_id=shoko_series_id):
+    save_mapping(anidb_id, episode, anilist_id, queue_query, series_name)
+    if post_to_anilist(anilist_id, episode, anidb_id=anidb_id):
         return STATUS_SUCCESS
-        
-    logger.warning("[Pipeline] Fallo de red durante la mutación final en AniList.")
+
     return STATUS_NETWORK_ERROR
 

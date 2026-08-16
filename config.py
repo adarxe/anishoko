@@ -27,3 +27,4 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ShokoAniSync")
 
+DB_PATH = "shoko_sync.db"
