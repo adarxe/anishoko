@@ -21,31 +21,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 self._send_response(200, "Ignored: Not PlaybackStop")
                 return
 
-            provider_ids = payload.get("ProviderIds", {})
-            provider_custom = payload.get("Provider_custom", "")
-
-            anidb_id = payload.get("Provider_anidb") or provider_ids.get("Anidb") or provider_ids.get("AniDB")
-
-            shoko_id = (
-                payload.get("Provider_shoko series") or
-                payload.get("Provider_shoko_series") or
-                provider_ids.get("Shoko Series") or
-                provider_ids.get("Shoko")
-            )
-
-            if not shoko_id and provider_custom:
-                match = re.search(r'seriesId=(\d+)', provider_custom)
-                if match:
-                    shoko_id = match.group(1)
-
-            has_shoko_marker = bool(shoko_id or re.search(r'seriesId=\d+', provider_custom) or provider_ids.get("Shoko Series") or provider_ids.get("Shoko"))
-            has_western_provider = any(k in provider_ids for k in ["Imdb", "Tvdb", "Tmdb", "IMDb", "TVDb", "TMDb"])
-
-            if not anidb_id or (has_western_provider and not has_shoko_marker):
-                logger.info("[Webhook] Evento omitido: Contenido no gestionado por AniDB/Shoko.")
-                self._send_response(200, "Ignored: Non-AniDB content")
-                return
-
+            # 1. Validación de umbral de reproducción y datos básicos
             played_to_completion = payload.get("PlayedToCompletion", False)
             position_ticks = payload.get("PlaybackPositionTicks") or payload.get("PositionTicks") or 0
             runtime_ticks = payload.get("RunTimeTicks") or 0
@@ -65,9 +41,47 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 self._send_response(400, "Missing episode number")
                 return
 
-            add_to_queue(anidb_id, 0, episode, search_query=item_name, series_name=series_name, shoko_id=shoko_id)
-            logger.info("[Webhook] Evento encolado: '%s' (AniDB: %s | Shoko: %s | Ep: %s | Progreso: %.1f%%)", 
-                        series_name, anidb_id, shoko_id or "N/A", episode, played_pct)
+            # 2. Extracción de Identificadores (Serie / Shoko)
+            series_provider_ids = payload.get("SeriesProviderIds") or payload.get("Series", {}).get("ProviderIds", {})
+            provider_ids = payload.get("ProviderIds", {})
+            provider_custom = payload.get("Provider_custom", "")
+
+            anidb_id = (
+                series_provider_ids.get("Anidb") or 
+                series_provider_ids.get("AniDB") or 
+                payload.get("Provider_anidb") or 
+                provider_ids.get("Anidb") or 
+                provider_ids.get("AniDB")
+            )
+
+            shoko_id = (
+                payload.get("Provider_shoko series") or
+                payload.get("Provider_shoko_series") or
+                payload.get("SeriesProviderIds", {}).get("Shoko Series") or
+                provider_ids.get("Shoko Series") or
+                provider_ids.get("Shoko")
+            )
+
+            if not shoko_id and provider_custom:
+                match = re.search(r'seriesId=(\d+)', provider_custom)
+                if match:
+                    shoko_id = match.group(1)
+
+            has_shoko_marker = bool(shoko_id or re.search(r'seriesId=\d+', provider_custom) or provider_ids.get("Shoko Series") or provider_ids.get("Shoko"))
+            has_western_provider = any(k in provider_ids for k in ["Imdb", "Tvdb", "Tmdb", "IMDb", "TVDb", "TMDb"])
+
+            if not anidb_id or (has_western_provider and not has_shoko_marker):
+                logger.info("[Webhook] Evento omitido: Contenido no gestionado por AniDB/Shoko.")
+                self._send_response(200, "Ignored: Non-AniDB content")
+                return
+
+            # 3. Clave primaria estática para L1 (Shoko_ID > SeriesName)
+            series_key = str(shoko_id) if shoko_id else series_name
+
+            # 4. Encolado de tarea unificada
+            add_to_queue(series_key, 0, episode, search_query=item_name, series_name=series_name, shoko_id=shoko_id or "")
+            logger.info("[Webhook] Evento encolado: '%s' (SeriesKey: %s | Ep: %s | Progreso: %.1f%%)", 
+                        series_name, series_key, episode, played_pct)
 
             notify_new_task()
             self._send_response(200, "Event Queued Successfully")
@@ -90,4 +104,3 @@ class WebhookHandler(BaseHTTPRequestHandler):
 def run_webhook_server(port):
     server = ThreadingHTTPServer(('0.0.0.0', port), WebhookHandler)
     server.serve_forever()
-

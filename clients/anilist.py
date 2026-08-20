@@ -106,28 +106,38 @@ def post_to_anilist(anilist_id, raw_target_episode, format_type="TV", anidb_id="
     target_status = user_status
     target_repeat = repeat_count
 
-    # --- MÁQUINA DE ESTADOS REWATCH ---
-    if is_completed_previously and is_single_entry:
+    # TRANSICIÓN AUTOMÁTICA: Si estaba en PLANNING/DROPPED/PAUSED -> CURRENT
+    if user_status in ["PLANNING", "DROPPED", "PAUSED"] and target_episode > 0:
+        target_status = "CURRENT"
+
+    # --- MÁQUINA DE ESTADOS: FORMATOS ÚNICOS (PELÍCULAS/OVAS/ONE-SHOTS) VS SERIES ---
+    if is_single_entry:
         target_episode = 1
         target_status = "COMPLETED"
-        target_repeat = repeat_count + 1
-    elif is_completed_previously:
-        # REWATCH GUARD: Solo permite rewatch si es el episodio 1 o 2.
-        if target_episode <= 2:
-            logger.info("[Rewatch] Inicio de re-visualizacion detectado. Estado: COMPLETED -> REPEATING")
-            target_status = "REPEATING"
-            current_watched = 0 
-        else:
-            logger.warning("[Rewatch Guard] Posible falso Rewatch evitado. Intentando ep %s en serie ya COMPLETADA.", target_episode)
-            return True # Tratado como éxito para eliminar de cola sin mutar
-    elif is_currently_rewatching:
-        target_status = "REPEATING"
-
-    if not is_single_entry and total_episodes and target_episode >= total_episodes:
-        target_episode = total_episodes
-        target_status = "COMPLETED"
-        if is_currently_rewatching:
+        if is_completed_previously:
+            # REWATCH DE PELÍCULA / ESPECIAL
             target_repeat = repeat_count + 1
+            logger.info("[Rewatch] Re-visualización de película/especial detectada. Repeticiones: %s", target_repeat)
+    else:
+        # SERIES TV / OVAS MULTI-EPISODIO
+        if is_completed_previously:
+            # REWATCH GUARD: Solo permite rewatch si es el episodio 1 o 2.
+            if target_episode <= 2:
+                logger.info("[Rewatch] Inicio de re-visualización detectado. Estado: COMPLETED -> REPEATING")
+                target_status = "REPEATING"
+                current_watched = 0 
+            else:
+                logger.warning("[Rewatch Guard] Posible falso Rewatch evitado. Intentando ep %s en serie ya COMPLETADA.", target_episode)
+                return True 
+        elif is_currently_rewatching:
+            target_status = "REPEATING"
+
+        # Transición a COMPLETED al llegar al último episodio
+        if total_episodes and target_episode >= total_episodes:
+            target_episode = total_episodes
+            target_status = "COMPLETED"
+            if is_currently_rewatching:
+                target_repeat = repeat_count + 1
 
     # --- VALIDACIÓN DE IDEMPOTENCIA ---
     if not (is_completed_previously and is_single_entry) and not (is_completed_previously and not is_currently_rewatching) and target_episode <= current_watched and user_status == target_status:

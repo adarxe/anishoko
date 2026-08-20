@@ -78,10 +78,11 @@ def get_mapping(anidb_id, episode):
         row = conn.execute('''
             SELECT anilist_id 
             FROM series_mapping 
-            WHERE anidb_id = ? AND episode = ?
+            WHERE anidb_id = ? AND (episode = ? OR episode = 0)
               AND last_updated >= datetime('now', '-30 days')
+            ORDER BY episode DESC
             LIMIT 1
-        ''', (anidb_id, episode)).fetchone()
+        ''', (str(anidb_id), episode)).fetchone()
         if row:
             return row[0]
     return None
@@ -97,7 +98,8 @@ def update_mirror_local_watch(anilist_id, episode_watched, user_status="CURRENT"
             WHERE anilist_id = ?
         ''', (episode_watched, user_status, repeat_count, anilist_id))
 
-def save_mapping(anidb_id, episode, anilist_id, search_query, romaji_name):
+def save_mapping(anidb_id, episode, anilist_id, search_query, romaji_name, is_ambiguous=False):
+    ep_to_save = episode if is_ambiguous else 0
     with get_connection() as conn:
         conn.execute('''
             INSERT INTO series_mapping (anidb_id, episode, anilist_id, search_query, romaji_name, last_updated)
@@ -107,7 +109,7 @@ def save_mapping(anidb_id, episode, anilist_id, search_query, romaji_name):
                 search_query = EXCLUDED.search_query,
                 romaji_name = EXCLUDED.romaji_name,
                 last_updated = CURRENT_TIMESTAMP
-        ''', (anidb_id, episode, anilist_id, search_query, romaji_name))
+        ''', (str(anidb_id), ep_to_save, anilist_id, search_query, romaji_name))
 
 def add_to_watch_history(anidb_id, episode, anilist_id, series_name=""):
     with get_connection() as conn:

@@ -19,6 +19,11 @@ def notify_new_task():
     task_event.set()
 
 def get_and_compact_pending_queue():
+    """
+    Retorna las tareas en orden cronológico (FIFO).
+    La compactación fue desactivada para preservar el historial individual
+    de cada episodio en el timeline de AniList tras recuperar la conexión.
+    """
     with get_connection() as conn:
         rows = conn.execute('''
             SELECT id, anidb_id, shoko_id, anilist_id, episode, search_query, series_name
@@ -27,30 +32,20 @@ def get_and_compact_pending_queue():
 
         if not rows: return []
 
-        grouped_items = {}
-        obsolete_queue_ids = []
-
+        tasks = []
         for row in rows:
             q_id, anidb_id, shoko_id, anilist_id, ep, query, s_name = row
-            group_key = f"anilist_{anilist_id}" if anilist_id and anilist_id > 0 else f"anidb_{anidb_id or s_name}"
+            tasks.append({
+                "queue_id": q_id, 
+                "anidb_id": anidb_id, 
+                "shoko_id": shoko_id, 
+                "anilist_id": anilist_id, 
+                "episode": int(ep), 
+                "search_query": query, 
+                "series_name": s_name
+            })
 
-            if group_key not in grouped_items:
-                grouped_items[group_key] = {"queue_id": q_id, "anidb_id": anidb_id, "shoko_id": shoko_id, "anilist_id": anilist_id, "episode": int(ep), "search_query": query, "series_name": s_name}
-            else:
-                existing_ep = grouped_items[group_key]["episode"]
-                new_ep = int(ep)
-                if new_ep >= existing_ep:
-                    obsolete_queue_ids.append(grouped_items[group_key]["queue_id"])
-                    grouped_items[group_key] = {"queue_id": q_id, "anidb_id": anidb_id, "shoko_id": shoko_id, "anilist_id": anilist_id, "episode": new_ep, "search_query": query, "series_name": s_name}
-                else:
-                    obsolete_queue_ids.append(q_id)
-
-        if obsolete_queue_ids:
-            placeholders = ','.join('?' for _ in obsolete_queue_ids)
-            conn.execute(f"DELETE FROM queue WHERE id IN ({placeholders})", obsolete_queue_ids)
-            logger.info("[Conserje] Compactación: %s tareas intermedias purgadas.", len(obsolete_queue_ids))
-
-        return list(grouped_items.values())
+        return tasks
 
 def offline_living_worker():
     logger.info("[Conserje] Worker de gestión de cola offline iniciado.")

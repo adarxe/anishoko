@@ -17,8 +17,9 @@ session.headers.update({
 
 def fetch_mal_id_from_shoko(shoko_id):
     """
-    Consulta Shoko usando únicamente el Shoko Series ID sin reintentos.
-    Falla en 1ms si el servidor no está activo.
+    Consulta Shoko Series ID. 
+    Si la obra contiene múltiples MAL IDs (ej. sagas de películas bajo un solo AniDB ID),
+    retorna None para forzar desambiguación precisa por título/episodio en las capas superiores.
     """
     if not SHOKO_URL or not shoko_id:
         return None
@@ -29,16 +30,20 @@ def fetch_mal_id_from_shoko(shoko_id):
         response = session.get(url, timeout=1.5)
         if response.status_code == 200:
             data = response.json()
-            mal_id = data.get("IDs", {}).get("MAL", [None])[0] or data.get("MalID")
-            if mal_id:
-                logger.info("[ShokoBridge] Éxito vía Shoko_ID %s -> MAL ID %s", shoko_id, mal_id)
-                return mal_id
-            else:
-                logger.info("[ShokoBridge] Serie %s encontrada en Shoko pero sin mapeo a MAL.", shoko_id)
-        else:
-            logger.warning("[ShokoBridge] HTTP %s desde endpoint: %s", response.status_code, url)
+            mal_ids = data.get("IDs", {}).get("MAL", [])
+            
+            # PROTECCIÓN ANTICORRUPCIÓN:
+            # Si hay exactamente 1 MAL ID, es seguro (serie estándar).
+            if len(mal_ids) == 1:
+                logger.info("[ShokoBridge] Éxito unívoco vía Shoko_ID %s -> MAL ID %s", shoko_id, mal_ids[0])
+                return mal_ids[0]
+            
+            # Si hay múltiples MAL IDs (ej. Kara no Kyoukai), rechazamos para desambiguar por episodio
+            if len(mal_ids) > 1:
+                logger.warning("[ShokoBridge] Ambigüedad detectada en Shoko_ID %s (%s MAL IDs). Pasando a desambiguación por episodio.", shoko_id, len(mal_ids))
+                return None
+                
     except requests.exceptions.RequestException:
-        logger.info("[ShokoBridge] Shoko Server no disponible en %s (0 ms fallback).", url)
+        logger.info("[ShokoBridge] Shoko Server no disponible (0 ms fallback).")
     
     return None
-

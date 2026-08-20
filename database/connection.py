@@ -21,6 +21,7 @@ def init_db():
                     anilist_id INTEGER NOT NULL,
                     search_query TEXT,
                     romaji_name TEXT,
+                    is_ambiguous INTEGER DEFAULT 0,
                     last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (anidb_id, episode)
                 );
@@ -28,7 +29,7 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS queue (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     anidb_id TEXT NOT NULL,
-                    shoko_id TEXT DEFAULT '',  -- <--- ¡ESTA ES LA QUE FALTABA!
+                    shoko_id TEXT DEFAULT '',
                     anilist_id INTEGER DEFAULT 0,
                     episode INTEGER NOT NULL,
                     search_query TEXT,

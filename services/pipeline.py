@@ -7,6 +7,7 @@ from database.repository import (
     save_mapping, 
     get_cached_relations,      
     save_cached_relations,
+    get_mirror_entry_by_id,
     get_all_mirror_entries
 )
 from clients.shoko import fetch_mal_id_from_shoko
@@ -61,42 +62,58 @@ def resolve_with_bfs_relations(seed_id, search_title):
         return best_match_id
     return None
 
+def clean_title_for_search(text):
+    if not text: return ""
+    text = re.sub(r'\b(19|20)\d{2}\b', '', text)
+    text = re.sub(r'[^\w\s\:\-\(\)]', '', text)
+    return re.sub(r'\s+', ' ', text).strip()
+
 def find_best_match_in_mirror(search_title):
-    """Busca en el espejo local usando token_sort_ratio para priorizar temporadas."""
     entries = get_all_mirror_entries()
     if not entries: return None
 
-    best_id = None
+    search_clean = search_title.lower().strip()
+    base_title = search_clean.split(':')[0].strip() if ':' in search_clean else search_clean
+
+    # PASO DE ORO: Si hay coincidencia EXACTA (100%), se retorna de inmediato
+    for anilist_id, t_rom, t_eng in entries:
+        t_rom_clean = (t_rom or "").lower().strip()
+        t_eng_clean = (t_eng or "").lower().strip()
+        if search_clean in (t_rom_clean, t_eng_clean):
+            logger.info("[MirrorMatch] Coincidencia EXACTA en Espejo: '%s' -> ID %s", search_title, anilist_id)
+            return anilist_id
+
+    # Evaluación por similitud si no hubo coincidencia exacta
+    best_match_id = None
     highest_score = 0
 
-    for anilist_id, t_romaji, t_english in entries:
-        score_romaji = fuzz.token_sort_ratio(search_title.lower(), (t_romaji or "").lower())
-        score_english = fuzz.token_sort_ratio(search_title.lower(), (t_english or "").lower())
-        
-        max_score = max(score_romaji, score_english)
+    for anilist_id, t_rom, t_eng in entries:
+        t_rom_clean = (t_rom or "").lower().strip()
+        t_eng_clean = (t_eng or "").lower().strip()
+        score_rom = fuzz.WRatio(search_clean, t_rom_clean)
+        score_eng = fuzz.WRatio(search_clean, t_eng_clean)
+        max_score = max(score_rom, score_eng)
+
         if max_score > highest_score:
             highest_score = max_score
-            best_id = anilist_id
+            best_match_id = anilist_id
 
-    if highest_score >= 80:
-        logger.info("[MirrorMatch] Coincidencia en Espejo Local: '%s' (ID %s | Score: %s)", search_title, best_id, highest_score)
-        return best_id
+    if highest_score >= 88 and best_match_id:
+        logger.info("[MirrorMatch] Mejor coincidencia relativa en Espejo (Score %s): '%s' -> ID %s", highest_score, search_title, best_match_id)
+        return best_match_id
+
     return None
 
 def process_webhook_payload(anidb_id, episode, series_name, item_name="", shoko_id=""):
-    """Orquesta la resolución Offline-First con la arquitectura de 4 capas."""
-    clean_series_name = re.sub(r'\b(19|20)\d{2}\b', '', series_name)
-    clean_series_name = re.sub(r'[^a-zA-Z0-9\s]', '', clean_series_name).strip()
-    
-    clean_item_name = re.sub(r'\b(19|20)\d{2}\b', '', item_name)
-    clean_item_name = re.sub(r'[^a-zA-Z0-9\s]', '', clean_item_name).strip()
-
+    clean_series_name = clean_title_for_search(series_name)
+    clean_item_name = clean_title_for_search(item_name)
     queue_query = f"{clean_series_name} {episode}".strip()
     full_search_title = f"{clean_series_name} {clean_item_name}".strip()
 
-    logger.info("[Pipeline] Resolviendo: Título='%s' | Ep=%s | AniDB_ID=%s | Shoko_ID=%s", series_name, episode, anidb_id, shoko_id or "N/A")
+    # anidb_id contiene ahora la clave persistente de la serie (ej: "12" o "Tsuihou Sareta...")
+    logger.info("[Pipeline] Resolviendo: Título='%s' | Ep=%s | SeriesKey=%s", clean_series_name, episode, anidb_id)
 
-    # PASO 1: Mapping L1 (0 ms) -> Requiere el episodio para la clave compuesta
+    # PASO 1: Cache L1 (0 ms)
     anilist_id = get_mapping(anidb_id, episode)
     if anilist_id:
         logger.info("[Pipeline] Paso 1 (Cache L1) superado -> ID %s", anilist_id)
@@ -104,46 +121,50 @@ def process_webhook_payload(anidb_id, episode, series_name, item_name="", shoko_
             return STATUS_SUCCESS
         return STATUS_NETWORK_ERROR
 
-    # PASO 2: Espejo Local L2.5 (0 ms) -> Match por token_sort_ratio
-    anilist_id = find_best_match_in_mirror(full_search_title) or find_best_match_in_mirror(clean_series_name)
+    # PASO 2: Espejo Local L2.5 (0 ms)
+    # PRIORIDAD: Primero se busca por el nombre exacto de la serie; si falla, por título completo
+    anilist_id = find_best_match_in_mirror(clean_series_name) or find_best_match_in_mirror(full_search_title)
     if anilist_id:
         logger.info("[Pipeline] Paso 2 (Espejo Local) superado -> ID %s", anilist_id)
-        save_mapping(anidb_id, episode, anilist_id, queue_query, series_name)
+
+        mirror_data = get_mirror_entry_by_id(anilist_id)
+        is_movie_saga = False
+        if mirror_data:
+            is_movie_saga = mirror_data.get("format") in ["MOVIE", "SPECIAL", "OVA", "ONA"]
+
+        save_mapping(anidb_id, episode, anilist_id, queue_query, series_name, is_ambiguous=is_movie_saga)
+
         if post_to_anilist(anilist_id, episode, anidb_id=anidb_id):
             return STATUS_SUCCESS
         return STATUS_NETWORK_ERROR
 
-    # PASO 3: Shoko Bridge L2 (0 ms si está apagado) -> Solo consulta shoko_id
+    # PASO 3: Shoko Bridge L2 (0 ms)
     if shoko_id:
         mal_id = fetch_mal_id_from_shoko(shoko_id)
         if mal_id:
             anilist_id = get_anilist_id_by_mal(mal_id)
             if anilist_id:
                 logger.info("[Pipeline] Paso 3 (Shoko Bridge) superado -> ID %s", anilist_id)
-                save_mapping(anidb_id, episode, anilist_id, queue_query, series_name)
+                save_mapping(anidb_id, episode, anilist_id, queue_query, series_name, is_ambiguous=False)
                 if post_to_anilist(anilist_id, episode, anidb_id=anidb_id):
                     return STATUS_SUCCESS
                 return STATUS_NETWORK_ERROR
 
-    # PASO 4: GraphQL API L3/L3.5 (Último recurso online)
+    # PASO 4: GraphQL API (Búsqueda remota)
     logger.info("[Pipeline] Paso 4 -> Iniciando búsqueda online en GraphQL...")
     seed_result = resolve_title_smart(clean_series_name)
     seed_id = seed_result[0] if isinstance(seed_result, tuple) else seed_result
 
-    if seed_id == "NETWORK_ERROR":
-        return STATUS_NETWORK_ERROR
-
-    if not seed_id:
-        return STATUS_UNRESOLVED
+    if seed_id == "NETWORK_ERROR": return STATUS_NETWORK_ERROR
+    if not seed_id: return STATUS_UNRESOLVED
 
     anilist_id = resolve_with_bfs_relations(seed_id, full_search_title)
     if not anilist_id:
         logger.critical("[Pipeline] REQUIERE INTERVENCIÓN MANUAL para '%s'.", full_search_title)
         return STATUS_REQUIRES_MANUAL
 
-    save_mapping(anidb_id, episode, anilist_id, queue_query, series_name)
+    save_mapping(anidb_id, episode, anilist_id, queue_query, series_name, is_ambiguous=True)
     if post_to_anilist(anilist_id, episode, anidb_id=anidb_id):
         return STATUS_SUCCESS
 
     return STATUS_NETWORK_ERROR
-
